@@ -13,10 +13,13 @@ from typing import Any, Dict, List, Tuple
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 
-from mmdet.models.dense_heads import RPNHead, CenterNetUpdateHead
-from mmdet.models.necks import FPN
-from projects.EfficientDet import efficientdet
-from mmengine import ConfigDict
+try:
+    from mmdet.models.dense_heads import RPNHead, CenterNetUpdateHead
+    from mmdet.models.necks import FPN
+    from projects.EfficientDet import efficientdet
+    from mmengine import ConfigDict
+except ImportError:
+    RPNHead = CenterNetUpdateHead = FPN = efficientdet = ConfigDict = None
 
 class Sam(nn.Module):
     mask_threshold: float = 0.0

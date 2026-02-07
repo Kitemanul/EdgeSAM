@@ -139,15 +139,22 @@ def check_onnx_ops(onnx_path):
     return ops
 
 
+def _onnx_export(*args, **kwargs):
+    """Call torch.onnx.export with legacy exporter for PyTorch >= 2.6 compatibility."""
+    import torch
+    major, minor = int(torch.__version__.split('.')[0]), int(torch.__version__.split('.')[1])
+    if major > 2 or (major == 2 and minor >= 6):
+        kwargs['dynamo'] = False
+    torch.onnx.export(*args, **kwargs)
+
+
 def export_encoder(sam, args):
     image_input = torch.randn(1, 3, 1024, 1024, dtype=torch.float)
     sam.forward = sam.forward_dummy_encoder
 
-    traced_model = torch.jit.trace(sam, image_input)
-
     out_path = args.output or args.checkpoint.replace('.pth', '_encoder_npu.onnx')
-    torch.onnx.export(
-        traced_model,
+    _onnx_export(
+        sam,
         image_input,
         out_path,
         input_names=["image"],
@@ -180,7 +187,7 @@ def export_decoder(sam, args):
     point_labels = torch.randint(low=0, high=4, size=(1, 5), dtype=torch.float)
 
     out_path = args.output or args.checkpoint.replace('.pth', '_decoder_npu.onnx')
-    torch.onnx.export(
+    _onnx_export(
         sam_decoder,
         (image_embeddings, point_coords, point_labels),
         out_path,

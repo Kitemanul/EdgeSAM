@@ -140,7 +140,7 @@ def _build_sam(image_encoder, checkpoint, enable_batch=False, enable_distill=Fal
         sam.eval()
         if checkpoint is not None:
             with open(checkpoint, "rb") as f:
-                state_dict = torch.load(f)
+                state_dict = torch.load(f, map_location="cpu")
             print(sam.load_state_dict(state_dict, strict=False))
     return sam
 
