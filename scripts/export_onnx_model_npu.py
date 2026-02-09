@@ -1,29 +1,37 @@
 """
 Export EdgeSAM decoder to ONNX for NPU compilation (opset 11).
 
-Replaces nn.LayerNorm and nn.GELU with manual implementations using only
-basic ops (mean, sqrt, mul, add, tanh) to maximize NPU compiler compatibility.
+NPU compatibility fixes applied:
+  1. nn.LayerNorm  → manual impl (avoids LayerNormalization op)
+  2. nn.GELU       → tanh approx  (avoids Erf op)
+  3. int64/int16   → int32        (NPU only supports int32)
+  4. dynamic_axes  → removed      (NPU quantization needs static shapes)
+  5. stability_score int16 → int32
 
 Usage:
-    # Export decoder
+    # Export decoder (fixed 5 prompt points)
     python scripts/export_onnx_model_npu.py weights/edge_sam_3x.pth --decoder --use-stability-score
+
+    # Export decoder with custom number of prompt points
+    python scripts/export_onnx_model_npu.py weights/edge_sam_3x.pth --decoder --use-stability-score --num-points 2
 
     # Export encoder
     python scripts/export_onnx_model_npu.py weights/edge_sam_3x.pth
 
-    # Check ops in exported model
+    # Check ops and data types in exported model
     python scripts/export_onnx_model_npu.py weights/edge_sam_3x.pth --decoder --check-ops-only
 """
 
 import torch
 import torch.nn as nn
 import argparse
+import numpy as np
 from edge_sam import sam_model_registry
 from edge_sam.utils.coreml import SamCoreMLModel
 
 
 parser = argparse.ArgumentParser(
-    description="Export EdgeSAM to ONNX for NPU (opset 11, no LayerNorm/GELU)."
+    description="Export EdgeSAM to ONNX for NPU (opset 11, no LayerNorm/GELU, int32 only)."
 )
 parser.add_argument(
     "checkpoint", type=str, help="The path to the EdgeSAM model checkpoint."
@@ -41,8 +49,12 @@ parser.add_argument(
     help="ONNX opset version (default: 11)",
 )
 parser.add_argument(
+    "--num-points", type=int, default=5,
+    help="Fixed number of prompt points for decoder export (default: 5)",
+)
+parser.add_argument(
     "--check-ops-only", action="store_true",
-    help="Only export and print all ONNX op types, do not save.",
+    help="Only export and print all ONNX op types and data types, do not save.",
 )
 parser.add_argument(
     "--output", type=str, default=None,
@@ -50,13 +62,12 @@ parser.add_argument(
 )
 
 
-class LayerNormManual(nn.Module):
-    """Drop-in replacement for nn.LayerNorm using only basic arithmetic ops.
+# ============================================================
+# Op replacements (PyTorch side, before export)
+# ============================================================
 
-    Avoids the native LayerNormalization ONNX op (opset 17+) and ensures
-    decomposition into ReduceMean/Sub/Pow/Sqrt/Mul/Add which are universally
-    supported.
-    """
+class LayerNormManual(nn.Module):
+    """Drop-in replacement for nn.LayerNorm using only basic arithmetic ops."""
 
     def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
         super().__init__()
@@ -70,7 +81,6 @@ class LayerNormManual(nn.Module):
             self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute mean and variance over the last len(normalized_shape) dims
         dims = list(range(-len(self.normalized_shape), 0))
         mean = x.mean(dim=dims, keepdim=True)
         var = ((x - mean) ** 2).mean(dim=dims, keepdim=True)
@@ -81,10 +91,7 @@ class LayerNormManual(nn.Module):
 
 
 class GELUManual(nn.Module):
-    """GELU approximation using tanh, avoiding the Erf op.
-
-    Uses: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    """
+    """GELU approximation using tanh, avoiding the Erf op."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return 0.5 * x * (1.0 + torch.tanh(
@@ -124,10 +131,202 @@ def replace_gelu(model):
     return count
 
 
-def check_onnx_ops(onnx_path):
-    """Print all unique op types in an ONNX model."""
+def patch_stability_score():
+    """Monkey-patch calculate_stability_score to use int32 instead of int16."""
+    import edge_sam.utils.amg as amg
+
+    def calculate_stability_score_int32(masks, mask_threshold, threshold_offset):
+        intersections = (
+            (masks > (mask_threshold + threshold_offset))
+            .sum(-1, dtype=torch.int32)
+            .sum(-1, dtype=torch.int32)
+        )
+        unions = (
+            (masks > (mask_threshold - threshold_offset))
+            .sum(-1, dtype=torch.int32)
+            .sum(-1, dtype=torch.int32)
+        )
+        return intersections / unions
+
+    amg.calculate_stability_score = calculate_stability_score_int32
+    # Also patch the import in coreml module
+    import edge_sam.utils.coreml as coreml_mod
+    if hasattr(coreml_mod, 'calculate_stability_score'):
+        coreml_mod.calculate_stability_score = calculate_stability_score_int32
+
+
+# ============================================================
+# ONNX post-processing: convert all int64/int16 → int32
+# ============================================================
+
+def simplify_onnx(onnx_path):
+    """Use onnxruntime graph optimizer to fold constants and simplify.
+
+    With static shapes, this folds away most Shape/Gather/Concat shape
+    computations, leaving mainly float compute nodes.
+    """
+    import onnxruntime as ort
+    import tempfile, shutil
+
+    simplified_path = onnx_path + ".simplified"
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    sess_options.optimized_model_filepath = simplified_path
+    # This creates the session AND saves the optimized model
+    ort.InferenceSession(onnx_path, sess_options)
+    shutil.move(simplified_path, onnx_path)
+    print(f"  Graph simplified with onnxruntime optimizer")
+
+
+def convert_onnx_int64_to_int32(onnx_path):
+    """Convert all int64/int16 → int32 in a simplified ONNX model.
+
+    Strategy: first simplify the graph (fold shape computations into
+    constants), then aggressively convert all remaining int64/int16 to
+    int32. After simplification, shape ops are largely eliminated, so
+    this is safe.
+
+    For any remaining Shape-consuming ops, we insert explicit Cast
+    nodes (int32→int64) at their shape inputs.
+    """
     import onnx
+    from onnx import TensorProto, numpy_helper, helper
+
+    # Step 1: Simplify graph (fold constants, eliminate shape subgraph)
+    simplify_onnx(onnx_path)
+
     model = onnx.load(onnx_path)
+    INT64 = TensorProto.INT64
+    INT16 = TensorProto.INT16
+    INT32 = TensorProto.INT32
+    converted = {"int64": 0, "int16": 0}
+
+    def _needs_fix(t):
+        return t in (INT64, INT16)
+
+    def _kind(t):
+        return "int64" if t == INT64 else "int16"
+
+    # Identify shape-consuming input positions that MUST be int64
+    SHAPE_INPUTS = {
+        "Reshape": {1}, "ConstantOfShape": {0}, "Expand": {1},
+        "Tile": {1}, "Slice": {1, 2, 3, 4}, "Unsqueeze": {1},
+    }
+
+    # Collect all tensor names at shape-consuming positions
+    shape_input_names = set()
+    for node in model.graph.node:
+        if node.op_type in SHAPE_INPUTS:
+            for idx in SHAPE_INPUTS[node.op_type]:
+                if idx < len(node.input) and node.input[idx]:
+                    shape_input_names.add(node.input[idx])
+
+    # 1. Convert Cast target types
+    for node in model.graph.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and _needs_fix(attr.i):
+                    converted[_kind(attr.i)] += 1
+                    attr.i = INT32
+
+    # 2. Convert ConstantOfShape output value type
+    for node in model.graph.node:
+        if node.op_type == "ConstantOfShape":
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t and _needs_fix(attr.t.data_type):
+                    converted[_kind(attr.t.data_type)] += 1
+                    arr = numpy_helper.to_array(attr.t).astype(np.int32)
+                    attr.t.CopyFrom(numpy_helper.from_array(arr))
+
+    # 3. Convert Constant nodes (but insert Cast for shape-consumed ones)
+    cast_nodes_to_add = []
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t and _needs_fix(attr.t.data_type):
+                    out_name = node.output[0] if node.output else None
+                    if out_name and out_name in shape_input_names:
+                        # This constant feeds a shape input — convert it
+                        # but add a Cast(int32→int64) between it and the consumer
+                        converted[_kind(attr.t.data_type)] += 1
+                        arr = numpy_helper.to_array(attr.t).astype(np.int32)
+                        attr.t.CopyFrom(numpy_helper.from_array(arr))
+                        # Rename output and insert Cast
+                        new_name = out_name + "_i32"
+                        node.output[0] = new_name
+                        cast_node = helper.make_node(
+                            "Cast", inputs=[new_name], outputs=[out_name],
+                            to=INT64, name=out_name + "_cast_to_i64"
+                        )
+                        cast_nodes_to_add.append(cast_node)
+                    else:
+                        converted[_kind(attr.t.data_type)] += 1
+                        arr = numpy_helper.to_array(attr.t).astype(np.int32)
+                        attr.t.CopyFrom(numpy_helper.from_array(arr))
+
+    # 4. Convert initializers (same logic)
+    for init in model.graph.initializer:
+        if _needs_fix(init.data_type):
+            if init.name in shape_input_names:
+                converted[_kind(init.data_type)] += 1
+                old_name = init.name
+                new_name = old_name + "_i32"
+                arr = numpy_helper.to_array(init).astype(np.int32)
+                new_init = numpy_helper.from_array(arr, name=new_name)
+                init.CopyFrom(new_init)
+                cast_node = helper.make_node(
+                    "Cast", inputs=[new_name], outputs=[old_name],
+                    to=INT64, name=old_name + "_cast_to_i64"
+                )
+                cast_nodes_to_add.append(cast_node)
+            else:
+                converted[_kind(init.data_type)] += 1
+                arr = numpy_helper.to_array(init).astype(np.int32)
+                new_init = numpy_helper.from_array(arr, name=init.name)
+                init.CopyFrom(new_init)
+
+    # Add Cast nodes
+    for cn in cast_nodes_to_add:
+        model.graph.node.append(cn)
+
+    # 5. Convert value_info and graph inputs/outputs
+    for vi in model.graph.value_info:
+        t = vi.type.tensor_type.elem_type
+        if _needs_fix(t):
+            converted[_kind(t)] += 1
+            vi.type.tensor_type.elem_type = INT32
+    for inp in model.graph.input:
+        t = inp.type.tensor_type.elem_type
+        if _needs_fix(t):
+            converted[_kind(t)] += 1
+            inp.type.tensor_type.elem_type = INT32
+    for out in model.graph.output:
+        t = out.type.tensor_type.elem_type
+        if _needs_fix(t):
+            converted[_kind(t)] += 1
+            out.type.tensor_type.elem_type = INT32
+
+    onnx.save(model, onnx_path)
+    total = converted["int64"] + converted["int16"]
+    print(f"  int64→int32: {converted['int64']}")
+    print(f"  int16→int32: {converted['int16']}")
+    print(f"  Cast nodes added (int32→int64 for shape inputs): {len(cast_nodes_to_add)}")
+    print(f"  Total: {total} type conversions")
+    return total
+
+
+# ============================================================
+# ONNX inspection
+# ============================================================
+
+def check_onnx_ops(onnx_path):
+    """Print all unique op types and data types in an ONNX model."""
+    import onnx
+    from onnx import TensorProto
+
+    dtype_names = {v: k for k, v in TensorProto.DataType.items()}
+    model = onnx.load(onnx_path)
+
     ops = set()
     for node in model.graph.node:
         ops.add(node.op_type)
@@ -136,12 +335,33 @@ def check_onnx_ops(onnx_path):
     print(f"Unique op types ({len(ops)}):")
     for op in sorted(ops):
         print(f"  - {op}")
+
+    # Check for remaining int64/int16
+    non_int32_types = set()
+    for init in model.graph.initializer:
+        if init.data_type in (TensorProto.INT64, TensorProto.INT16):
+            non_int32_types.add(f"initializer:{init.name}={dtype_names.get(init.data_type, init.data_type)}")
+    for node in model.graph.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i in (TensorProto.INT64, TensorProto.INT16):
+                    non_int32_types.add(f"Cast→{dtype_names.get(attr.i, attr.i)}")
+    if non_int32_types:
+        print(f"\n  WARNING: remaining int64/int16 found:")
+        for t in sorted(non_int32_types):
+            print(f"    {t}")
+    else:
+        print(f"\n  OK: no int64/int16 remaining")
+
     return ops
 
 
+# ============================================================
+# Export functions
+# ============================================================
+
 def _onnx_export(*args, **kwargs):
     """Call torch.onnx.export with legacy exporter for PyTorch >= 2.6 compatibility."""
-    import torch
     major, minor = int(torch.__version__.split('.')[0]), int(torch.__version__.split('.')[1])
     if major > 2 or (major == 2 and minor >= 6):
         kwargs['dynamo'] = False
@@ -163,10 +383,18 @@ def export_encoder(sam, args):
         verbose=False,
     )
     print(f"Exported encoder to {out_path}")
+
+    # Post-process: convert int64/int16 → int32
+    print("\nConverting int64/int16 → int32...")
+    convert_onnx_int64_to_int32(out_path)
+
     return out_path
 
 
 def export_decoder(sam, args):
+    # Patch stability score to use int32 instead of int16
+    patch_stability_score()
+
     sam_decoder = SamCoreMLModel(
         model=sam,
         use_stability_score=args.use_stability_score,
@@ -181,10 +409,12 @@ def export_decoder(sam, args):
 
     embed_dim = sam.prompt_encoder.embed_dim
     embed_size = sam.prompt_encoder.image_embedding_size
+    num_points = args.num_points
 
+    # Fixed shapes — no dynamic axes for NPU quantization
     image_embeddings = torch.randn(1, embed_dim, *embed_size, dtype=torch.float)
-    point_coords = torch.randint(low=0, high=1024, size=(1, 5, 2), dtype=torch.float)
-    point_labels = torch.randint(low=0, high=4, size=(1, 5), dtype=torch.float)
+    point_coords = torch.randint(low=0, high=1024, size=(1, num_points, 2), dtype=torch.float)
+    point_labels = torch.randint(low=0, high=4, size=(1, num_points), dtype=torch.float)
 
     out_path = args.output or args.checkpoint.replace('.pth', '_decoder_npu.onnx')
     _onnx_export(
@@ -194,13 +424,15 @@ def export_decoder(sam, args):
         input_names=["image_embeddings", "point_coords", "point_labels"],
         output_names=["scores", "masks"],
         opset_version=args.opset,
-        dynamic_axes={
-            "point_coords": {1: "num_points"},
-            "point_labels": {1: "num_points"},
-        },
+        # No dynamic_axes — fixed shapes for NPU quantization
         verbose=False,
     )
-    print(f"Exported decoder to {out_path}")
+    print(f"Exported decoder to {out_path} (fixed {num_points} points)")
+
+    # Post-process: convert int64/int16 → int32
+    print("\nConverting int64/int16 → int32...")
+    convert_onnx_int64_to_int32(out_path)
+
     return out_path
 
 
