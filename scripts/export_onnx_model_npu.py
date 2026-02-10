@@ -179,18 +179,18 @@ def simplify_onnx(onnx_path):
 
 
 def convert_onnx_int64_to_int32(onnx_path):
-    """Convert all int64/int16 → int32 in a simplified ONNX model.
+    """Aggressively convert ALL int64/int16 → int32 in ONNX model.
 
     Strategy: first simplify the graph (fold shape computations into
-    constants), then aggressively convert all remaining int64/int16 to
-    int32. After simplification, shape ops are largely eliminated, so
-    this is safe.
+    constants), then convert every int64/int16 occurrence to int32
+    with no exceptions. This includes shape inputs to Reshape/Expand/etc.
 
-    For any remaining Shape-consuming ops, we insert explicit Cast
-    nodes (int32→int64) at their shape inputs.
+    The resulting model is NOT valid per ONNX spec (shape inputs should
+    be int64), but NPU compilers have their own type system and only
+    accept int32. No Cast bridge nodes are inserted.
     """
     import onnx
-    from onnx import TensorProto, numpy_helper, helper
+    from onnx import TensorProto, numpy_helper
 
     # Step 1: Simplify graph (fold constants, eliminate shape subgraph)
     simplify_onnx(onnx_path)
@@ -207,21 +207,7 @@ def convert_onnx_int64_to_int32(onnx_path):
     def _kind(t):
         return "int64" if t == INT64 else "int16"
 
-    # Identify shape-consuming input positions that MUST be int64
-    SHAPE_INPUTS = {
-        "Reshape": {1}, "ConstantOfShape": {0}, "Expand": {1},
-        "Tile": {1}, "Slice": {1, 2, 3, 4}, "Unsqueeze": {1},
-    }
-
-    # Collect all tensor names at shape-consuming positions
-    shape_input_names = set()
-    for node in model.graph.node:
-        if node.op_type in SHAPE_INPUTS:
-            for idx in SHAPE_INPUTS[node.op_type]:
-                if idx < len(node.input) and node.input[idx]:
-                    shape_input_names.add(node.input[idx])
-
-    # 1. Convert Cast target types
+    # 1. Cast nodes: change target type
     for node in model.graph.node:
         if node.op_type == "Cast":
             for attr in node.attribute:
@@ -229,7 +215,7 @@ def convert_onnx_int64_to_int32(onnx_path):
                     converted[_kind(attr.i)] += 1
                     attr.i = INT32
 
-    # 2. Convert ConstantOfShape output value type
+    # 2. ConstantOfShape: change output value type
     for node in model.graph.node:
         if node.op_type == "ConstantOfShape":
             for attr in node.attribute:
@@ -238,80 +224,42 @@ def convert_onnx_int64_to_int32(onnx_path):
                     arr = numpy_helper.to_array(attr.t).astype(np.int32)
                     attr.t.CopyFrom(numpy_helper.from_array(arr))
 
-    # 3. Convert Constant nodes (but insert Cast for shape-consumed ones)
-    cast_nodes_to_add = []
+    # 3. Constant nodes: change all int64/int16 data
     for node in model.graph.node:
         if node.op_type == "Constant":
             for attr in node.attribute:
                 if attr.name == "value" and attr.t and _needs_fix(attr.t.data_type):
-                    out_name = node.output[0] if node.output else None
-                    if out_name and out_name in shape_input_names:
-                        # This constant feeds a shape input — convert it
-                        # but add a Cast(int32→int64) between it and the consumer
-                        converted[_kind(attr.t.data_type)] += 1
-                        arr = numpy_helper.to_array(attr.t).astype(np.int32)
-                        attr.t.CopyFrom(numpy_helper.from_array(arr))
-                        # Rename output and insert Cast
-                        new_name = out_name + "_i32"
-                        node.output[0] = new_name
-                        cast_node = helper.make_node(
-                            "Cast", inputs=[new_name], outputs=[out_name],
-                            to=INT64, name=out_name + "_cast_to_i64"
-                        )
-                        cast_nodes_to_add.append(cast_node)
-                    else:
-                        converted[_kind(attr.t.data_type)] += 1
-                        arr = numpy_helper.to_array(attr.t).astype(np.int32)
-                        attr.t.CopyFrom(numpy_helper.from_array(arr))
+                    converted[_kind(attr.t.data_type)] += 1
+                    arr = numpy_helper.to_array(attr.t).astype(np.int32)
+                    attr.t.CopyFrom(numpy_helper.from_array(arr))
 
-    # 4. Convert initializers (same logic)
+    # 4. Initializers
     for init in model.graph.initializer:
         if _needs_fix(init.data_type):
-            if init.name in shape_input_names:
-                converted[_kind(init.data_type)] += 1
-                old_name = init.name
-                new_name = old_name + "_i32"
-                arr = numpy_helper.to_array(init).astype(np.int32)
-                new_init = numpy_helper.from_array(arr, name=new_name)
-                init.CopyFrom(new_init)
-                cast_node = helper.make_node(
-                    "Cast", inputs=[new_name], outputs=[old_name],
-                    to=INT64, name=old_name + "_cast_to_i64"
-                )
-                cast_nodes_to_add.append(cast_node)
-            else:
-                converted[_kind(init.data_type)] += 1
-                arr = numpy_helper.to_array(init).astype(np.int32)
-                new_init = numpy_helper.from_array(arr, name=init.name)
-                init.CopyFrom(new_init)
+            converted[_kind(init.data_type)] += 1
+            arr = numpy_helper.to_array(init).astype(np.int32)
+            new_init = numpy_helper.from_array(arr, name=init.name)
+            init.CopyFrom(new_init)
 
-    # Add Cast nodes
-    for cn in cast_nodes_to_add:
-        model.graph.node.append(cn)
-
-    # 5. Convert value_info and graph inputs/outputs
+    # 5. Value info, graph inputs, graph outputs
     for vi in model.graph.value_info:
-        t = vi.type.tensor_type.elem_type
-        if _needs_fix(t):
-            converted[_kind(t)] += 1
+        if _needs_fix(vi.type.tensor_type.elem_type):
+            converted[_kind(vi.type.tensor_type.elem_type)] += 1
             vi.type.tensor_type.elem_type = INT32
     for inp in model.graph.input:
-        t = inp.type.tensor_type.elem_type
-        if _needs_fix(t):
-            converted[_kind(t)] += 1
+        if _needs_fix(inp.type.tensor_type.elem_type):
+            converted[_kind(inp.type.tensor_type.elem_type)] += 1
             inp.type.tensor_type.elem_type = INT32
     for out in model.graph.output:
-        t = out.type.tensor_type.elem_type
-        if _needs_fix(t):
-            converted[_kind(t)] += 1
+        if _needs_fix(out.type.tensor_type.elem_type):
+            converted[_kind(out.type.tensor_type.elem_type)] += 1
             out.type.tensor_type.elem_type = INT32
 
     onnx.save(model, onnx_path)
     total = converted["int64"] + converted["int16"]
     print(f"  int64→int32: {converted['int64']}")
     print(f"  int16→int32: {converted['int16']}")
-    print(f"  Cast nodes added (int32→int64 for shape inputs): {len(cast_nodes_to_add)}")
-    print(f"  Total: {total} type conversions")
+    print(f"  Total: {total} type conversions (no Cast bridges)")
     return total
 
 
