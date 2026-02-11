@@ -36,14 +36,22 @@ EdgeSAM 的 ONNX decoder 在 TV NPU 编译器上编译失败。根因是 decoder
 ```
 阶段 1：PyTorch 侧（导出前）            阶段 2：ONNX 侧（导出后）
 ┌─────────────────────────────┐    ┌──────────────────────────────────┐
-│ ① nn.LayerNorm → 手写实现    │    │ ④ onnxruntime 图简化（常量折叠）   │
-│ ② nn.GELU → tanh 近似       │    │ ⑤ int64/int16 → int32 全量转换    │
-│ ③ stability_score int16→int32│    │    （无 Cast 桥接，直接强转）       │
+│ ① nn.GELU → tanh 近似       │    │ ④ onnxruntime 图简化（常量折叠）   │
+│ ② stability_score int16→int32│    │ ⑤ int64/int16 → int32 全量转换    │
+│ ③ OneHot → Gather 查表       │    │    （7 处位置，无 Cast 桥接）       │
 │    + 去掉 dynamic_axes       │    │                                  │
 └─────────────────────────────┘    └──────────────────────────────────┘
 ```
 
-### 修复 ①：nn.LayerNorm → LayerNormManual
+> **关于 nn.LayerNorm**：在 opset >= 17 时会导出为 `LayerNormalization` 原生算子，
+> NPU 不支持。但本脚本使用 **opset 11**，PyTorch exporter 会自动将 LayerNorm 分解为
+> ReduceMean/Sub/Pow/Sqrt/Div/Mul/Add 基本算子，因此**无需手动替换**。
+> 如果未来需要更高 opset，参考下方「修复 ①（参考）」一节。
+
+### 修复 ①（参考）：nn.LayerNorm → LayerNormManual
+
+> **注意**：当前脚本使用 opset 11，PyTorch 会自动分解 LayerNorm，因此**无需此修复**。
+> 此节仅作参考，供未来使用更高 opset 时使用。
 
 **问题**：`nn.LayerNorm` 在 opset >= 17 导出为原生 `LayerNormalization` 算子，NPU 不支持。
 
@@ -420,9 +428,9 @@ state_dict = torch.load(f, map_location="cpu")
           │  权重已就位
           ▼
   ┌───────────────────────┐
-  │ ① replace_layernorm() │  9 个 nn.LayerNorm → LayerNormManual
-  │ ② replace_gelu()      │  nn.GELU → GELUManual (tanh)
-  │ ③ patch_stability_score│  int16 → int32
+  │ ① replace_gelu()      │  2 个 nn.GELU → GELUManual (tanh)
+  │ ② patch_stability_score│  int16 → int32
+  │ ③ SamCoreMLModelNPU   │  OneHot → Gather 查表
   └───────┬───────────────┘
           │  权重通过 nn.Parameter 引用传递
           ▼
@@ -440,7 +448,9 @@ state_dict = torch.load(f, map_location="cpu")
           │  简化后
           ▼
   ┌───────────────────────┐
-  │ ⑤ int64 → int32 强转  │  81 处转换, 无 Cast 桥接
+  │ ⑤ int64 → int32 全量   │  7 处位置, 无 Cast 桥接
+  │   转换 (含 Constant,   │
+  │   Initializer 等)     │
   └───────┬───────────────┘
           │
           ▼
