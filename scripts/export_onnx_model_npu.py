@@ -99,95 +99,61 @@ class SamCoreMLModelNPU(SamCoreMLModel):
 # ONNX post-processing: fix data types for NPU compatibility
 # ============================================================
 
-# Ops whose shape/index inputs MUST remain int64 per ONNX spec.
-# Maps op_type → set of input positions that require int64.
-_OPS_REQUIRING_INT64 = {
-    "Reshape":          {1},           # shape
-    "Expand":           {1},           # shape
-    "Tile":             {1},           # repeats
-    "ConstantOfShape":  {0},           # shape
-    "Slice":            {1, 2, 3, 4},  # starts, ends, axes, steps
-    "Resize":           {1, 2, 3},     # roi, scales, sizes
-    "Range":            {0, 1, 2},     # start, limit, delta
-    "Gather":           {1},           # indices (keep int64 for safety)
-}
-
-
-def _collect_must_stay_int64(graph):
-    """Return the set of tensor names that must remain int64."""
-    must_keep = set()
-    for node in graph.node:
-        positions = _OPS_REQUIRING_INT64.get(node.op_type)
-        if positions is None:
-            continue
-        for pos in positions:
-            if pos < len(node.input) and node.input[pos]:
-                must_keep.add(node.input[pos])
-    return must_keep
-
-
 def fix_dtypes_for_npu(onnx_path):
-    """Convert int16 → int32 and selectively convert int64 → int32.
+    """Convert ALL int16 and int64 → int32, then re-infer shapes.
 
-    int16 (from stability score): always converted to int32.
-    int64: converted to int32 UNLESS the tensor feeds an op that requires
-    int64 per ONNX spec (Reshape shape, Slice indices, etc.).
+    Selective conversion (keeping some int64) creates type mismatches
+    that cause MLIR assertion failures in onnx2circle.  Converting
+    everything uniformly and running shape inference keeps the graph
+    self-consistent.  Circle/TFLite uses int32 for shapes internally,
+    so int32 Reshape/Slice inputs are fine.
     """
     import onnx
-    from onnx import TensorProto, numpy_helper
+    from onnx import TensorProto, numpy_helper, shape_inference
 
     model = onnx.load(onnx_path)
     INT64 = TensorProto.INT64
     INT16 = TensorProto.INT16
     INT32 = TensorProto.INT32
     convertible = {INT64, INT16}
-
-    must_keep_int64 = _collect_must_stay_int64(model.graph)
     count = 0
 
     # --- Cast nodes ---
     for node in model.graph.node:
-        if node.op_type != "Cast":
-            continue
-        for attr in node.attribute:
-            if attr.name != "to" or attr.i not in convertible:
-                continue
-            if attr.i == INT16:
-                attr.i = INT32
-                count += 1
-            elif attr.i == INT64:
-                if not any(o in must_keep_int64 for o in node.output):
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i in convertible:
                     attr.i = INT32
                     count += 1
 
     # --- Constant nodes ---
     for node in model.graph.node:
-        if node.op_type != "Constant":
-            continue
-        if any(o in must_keep_int64 for o in node.output):
-            continue
-        for attr in node.attribute:
-            if attr.name == "value" and attr.t and attr.t.data_type in convertible:
-                arr = numpy_helper.to_array(attr.t).astype(np.int32)
-                attr.t.CopyFrom(numpy_helper.from_array(arr))
-                count += 1
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t and attr.t.data_type in convertible:
+                    arr = numpy_helper.to_array(attr.t).astype(np.int32)
+                    attr.t.CopyFrom(numpy_helper.from_array(arr))
+                    count += 1
 
     # --- Initializers ---
     for init in model.graph.initializer:
-        if init.data_type in convertible and init.name not in must_keep_int64:
+        if init.data_type in convertible:
             arr = numpy_helper.to_array(init).astype(np.int32)
             new_init = numpy_helper.from_array(arr, name=init.name)
             init.CopyFrom(new_init)
             count += 1
 
-    # --- Graph inputs/outputs/value_info ---
+    # --- Graph inputs / outputs / value_info ---
     for vi in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
-        if vi.type.tensor_type.elem_type in convertible and vi.name not in must_keep_int64:
+        if vi.type.tensor_type.elem_type in convertible:
             vi.type.tensor_type.elem_type = INT32
             count += 1
 
+    # Re-infer shapes so all type annotations are self-consistent
+    model = shape_inference.infer_shapes(model)
+
     onnx.save(model, onnx_path)
-    print(f"  Fixed {count} dtype occurrences (int16/int64 → int32, preserving spec-required int64)")
+    print(f"  Converted {count} int16/int64 → int32 occurrences (+ shape inference)")
 
 
 # ============================================================
