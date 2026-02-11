@@ -28,6 +28,7 @@ import argparse
 import numpy as np
 from edge_sam import sam_model_registry
 from edge_sam.utils.coreml import SamCoreMLModel
+from edge_sam.utils.amg import calculate_stability_score
 
 
 parser = argparse.ArgumentParser(
@@ -60,6 +61,56 @@ parser.add_argument(
     "--output", type=str, default=None,
     help="Output ONNX file path. If not set, auto-generated from checkpoint path.",
 )
+
+
+# ============================================================
+# NPU-compatible decoder wrapper (avoids OneHot op)
+# ============================================================
+
+class SamCoreMLModelNPU(SamCoreMLModel):
+    """Override _embed_points to use Gather instead of OneHot.
+
+    The original _embed_points compares point_labels against each label value
+    in a loop: ``(point_labels == i) for i in range(4)``.  The ONNX exporter
+    fuses these comparisons into an ``onnx.OneHot`` op, which many NPU
+    compilers cannot legalize.
+
+    This version builds a single embedding lookup table and uses
+    ``torch.index_select`` (→ ONNX ``Gather``) to select embeddings,
+    completely avoiding any OneHot pattern.
+    """
+
+    def _embed_points(self, point_coords: torch.Tensor, point_labels: torch.Tensor) -> torch.Tensor:
+        point_coords = point_coords + 0.5
+        point_coords = point_coords / self.img_size
+        point_embedding = self.model.prompt_encoder.pe_layer._pe_encoding(point_coords)
+
+        # Build lookup table: [num_labels, embed_dim]
+        #   index 0 → not_a_point_embed  (label == -1)
+        #   index 1 → point_embeddings[0] (label == 0)
+        #   index 2 → point_embeddings[1] (label == 1)
+        #   index 3 → point_embeddings[2] (label == 2)
+        #   index 4 → point_embeddings[3] (label == 3)
+        all_embeddings = torch.cat([
+            self.model.prompt_encoder.not_a_point_embed.weight,
+        ] + [
+            pe.weight for pe in self.model.prompt_encoder.point_embeddings
+        ], dim=0)  # [5, embed_dim]
+
+        # Shift labels so -1 → 0, 0 → 1, …, 3 → 4
+        indices = (point_labels + 1).to(torch.long)  # [B, N]
+
+        # Gather embeddings (ONNX Gather op, no OneHot)
+        flat_indices = indices.reshape(-1)
+        selected = torch.index_select(all_embeddings, 0, flat_indices)
+        selected = selected.reshape(indices.shape[0], indices.shape[1], -1)  # [B, N, embed_dim]
+
+        # Zero out position encoding for not-a-point labels (index 0).
+        # clamp(0,1) maps 0→0 and 1..4→1, producing a float mask via Clip op.
+        keep_mask = indices.to(point_embedding.dtype).clamp(min=0.0, max=1.0).unsqueeze(-1)
+
+        point_embedding = point_embedding * keep_mask + selected
+        return point_embedding
 
 
 # ============================================================
@@ -343,7 +394,7 @@ def export_decoder(sam, args):
     # Patch stability score to use int32 instead of int16
     patch_stability_score()
 
-    sam_decoder = SamCoreMLModel(
+    sam_decoder = SamCoreMLModelNPU(
         model=sam,
         use_stability_score=args.use_stability_score,
     )
