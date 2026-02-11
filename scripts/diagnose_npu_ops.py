@@ -1,413 +1,424 @@
 #!/usr/bin/env python
 """
-Diagnose NPU compilation failures by testing individual ONNX operator groups.
+Diagnose NPU compilation failures by exporting 3 decoder sub-modules.
 
-Generates minimal ONNX models (opset 11, all int64 converted to int32 —
-matching the real NPU export pipeline), each isolating one group of operators
-from the EdgeSAM decoder.  Compile each .onnx with your NPU toolchain;
-pass/fail results pinpoint the problematic operator(s).
+Splits the EdgeSAM decoder into 3 structural parts and exports each as
+an independent ONNX model with all NPU fixes applied (opset 11, GELU->tanh,
+int16->int32, graph simplification, int64->int32).  Compile each with your
+NPU toolchain; pass/fail pinpoints which subsystem is problematic.
 
-Operator coverage (27 operators, 8 test models):
+  Part 1 — Prompt Encoding:
+    point_coords + point_labels -> sparse_embedding
+    Operators: MatMul, Sin, Cos, Concat, Equal, Not, Cast, Expand,
+              Unsqueeze, Mul, Add, Sub
 
-  Test model          | Operators tested
-  --------------------+------------------------------------------------------
-  01_conv_transpose   | ConvTranspose, Relu
-  02_bool_logic       | Equal, Not, Cast
-  03_gather           | Gather
-  04_tile_expand      | Tile, Expand, Unsqueeze
-  05_attention        | MatMul, Softmax, Transpose, Reshape, Slice, Mul
-  06_layernorm        | ReduceMean, Sub, Pow, Sqrt, Div, Mul, Add
-  07_sincos_pe        | Sin, Cos, Mul, Concat
-  08_gemm_tanh        | Gemm, Tanh
+  Part 2 — Transformer:
+    image_embeddings + sparse_embedding -> (hs, src)
+    Operators: Gemm, MatMul, Softmax, Reshape, Transpose, Add, Mul,
+              ReduceMean, Sub, Pow, Sqrt, Div (decomposed LayerNorm), Relu
+
+  Part 3 — Mask Head:
+    (hs, src) -> (scores, masks)
+    Operators: ConvTranspose, Tanh, Gemm, Relu, MatMul, Reshape,
+              ReduceMean, Pow, Sqrt, Div (LayerNorm2d), Cast, Slice
 
 Usage:
-    python scripts/diagnose_npu_ops.py [--output-dir ./npu_diag]
-
-Then compile each generated .onnx file with your NPU compiler and report
-which ones PASS and which ones FAIL.
+    python scripts/diagnose_npu_ops.py weights/edge_sam_3x.pth
+    python scripts/diagnose_npu_ops.py weights/edge_sam_3x.pth --output-dir ./npu_diag
+    python scripts/diagnose_npu_ops.py weights/edge_sam_3x.pth --num-points 2
 """
 
 import argparse
 import os
+from collections import Counter
 
-import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
+import torch
+import torch.nn as nn
 
-OPSET = 11
-IR_VERSION = 6
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def _build_model(name, nodes, inputs, outputs, initializers=None):
-    """Build opset-11 model, validate, convert int64→int32, return."""
-    graph = helper.make_graph(
-        nodes, name, inputs, outputs, initializer=initializers or [],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", OPSET)]
-    )
-    model.ir_version = IR_VERSION
-    onnx.checker.check_model(model)
-    # Match real NPU export: convert all int64/int16 → int32
-    _convert_int_to_int32(model)
-    return model
+from edge_sam import sam_model_registry
 
 
-def _convert_int_to_int32(model):
-    """In-place int64/int16 → int32 (mirrors NPU export Fix 4)."""
-    CONVERTIBLE = {TensorProto.INT64, TensorProto.INT16}
+# ============================================================
+# NPU fixes (reused from export_onnx_model_npu.py)
+# ============================================================
+
+class GELUManual(nn.Module):
+    """GELU using tanh approximation (eliminates Erf op)."""
+
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(
+            0.7978845608028654 * (x + 0.044715 * x * x * x)
+        ))
+
+
+def replace_gelu(model):
+    count = 0
+    for name, module in model.named_modules():
+        for attr_name in list(module._modules.keys()):
+            if isinstance(module._modules[attr_name], nn.GELU):
+                module._modules[attr_name] = GELUManual()
+                count += 1
+    return count
+
+
+def simplify_onnx(path):
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("    WARNING: onnxruntime not installed, skipping graph simplification")
+        return
+    tmp = path + ".tmp"
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    opts.optimized_model_filepath = tmp
+    ort.InferenceSession(path, opts)
+    os.replace(tmp, path)
+    print("    Graph simplification (constant folding) done")
+
+
+def convert_int64_to_int32(path):
+    import onnx
+    import numpy as np
+    from onnx import TensorProto
+
+    model = onnx.load(path)
+    CONV = {TensorProto.INT64, TensorProto.INT16}
+    count = 0
+
+    def _dt(d):
+        return np.int64 if d == TensorProto.INT64 else np.int16
 
     for node in model.graph.node:
         if node.op_type == "Cast":
             for a in node.attribute:
-                if a.name == "to" and a.i in CONVERTIBLE:
+                if a.name == "to" and a.i in CONV:
                     a.i = TensorProto.INT32
+                    count += 1
         if node.op_type in ("Constant", "ConstantOfShape"):
             for a in node.attribute:
-                if a.name == "value" and a.t.data_type in CONVERTIBLE:
-                    dt = np.int64 if a.t.data_type == TensorProto.INT64 else np.int16
-                    arr = np.frombuffer(a.t.raw_data, dtype=dt)
-                    a.t.raw_data = arr.astype(np.int32).tobytes()
+                if a.name == "value" and a.t.data_type in CONV:
+                    raw = np.frombuffer(a.t.raw_data, dtype=_dt(a.t.data_type))
+                    a.t.raw_data = raw.astype(np.int32).tobytes()
                     a.t.data_type = TensorProto.INT32
-
+                    count += 1
     for init in model.graph.initializer:
-        if init.data_type in CONVERTIBLE:
-            dt = np.int64 if init.data_type == TensorProto.INT64 else np.int16
-            arr = np.frombuffer(init.raw_data, dtype=dt)
-            init.raw_data = arr.astype(np.int32).tobytes()
+        if init.data_type in CONV:
+            raw = np.frombuffer(init.raw_data, dtype=_dt(init.data_type))
+            init.raw_data = raw.astype(np.int32).tobytes()
             init.data_type = TensorProto.INT32
-
-    for coll in (model.graph.input, model.graph.output, model.graph.value_info):
+            count += 1
+    for coll in (model.graph.value_info, model.graph.input, model.graph.output):
         for vi in coll:
-            if vi.type.tensor_type.elem_type in CONVERTIBLE:
+            if vi.type.tensor_type.elem_type in CONV:
                 vi.type.tensor_type.elem_type = TensorProto.INT32
+                count += 1
+
+    del model.graph.value_info[:]
+    try:
+        from onnx import shape_inference
+        model = shape_inference.infer_shapes(model)
+    except Exception:
+        pass
+
+    onnx.save(model, path)
+    print(f"    int64/int16 -> int32: {count} conversions")
 
 
-def _list_ops(model):
-    """Return sorted unique operator names from a model."""
-    return sorted(set(n.op_type for n in model.graph.node))
+def print_summary(path):
+    import onnx
+    dtype_names = {
+        1: "FLOAT", 2: "UINT8", 3: "INT8", 5: "INT16",
+        6: "INT32", 7: "INT64", 9: "BOOL", 10: "FLOAT16",
+    }
+    model = onnx.load(path)
+    ops = Counter(n.op_type for n in model.graph.node)
+    dtypes = set()
+    for init in model.graph.initializer:
+        dtypes.add(dtype_names.get(init.data_type, "?"))
+    for inp in model.graph.input:
+        dtypes.add(dtype_names.get(inp.type.tensor_type.elem_type, "?"))
+
+    print(f"    Nodes: {len(model.graph.node)},  Op types: {len(ops)}")
+    print(f"    Ops: {', '.join(sorted(ops))}")
+    print(f"    Dtypes: {', '.join(sorted(dtypes))}")
+
+    for inp in model.graph.input:
+        shape = [d.dim_value or d.dim_param
+                 for d in inp.type.tensor_type.shape.dim]
+        dt = dtype_names.get(inp.type.tensor_type.elem_type, "?")
+        print(f"    Input  {inp.name}: {dt} {shape}")
+    for out in model.graph.output:
+        shape = [d.dim_value or d.dim_param
+                 for d in out.type.tensor_type.shape.dim]
+        dt = dtype_names.get(out.type.tensor_type.elem_type, "?")
+        print(f"    Output {out.name}: {dt} {shape}")
 
 
-# ------------------------------------------------------------------
-# Test model builders
-# ------------------------------------------------------------------
+def _onnx_export(*args, **kwargs):
+    parts = torch.__version__.split('.')
+    major, minor = int(parts[0]), int(parts[1])
+    if major > 2 or (major == 2 and minor >= 6):
+        kwargs['dynamo'] = False
+    torch.onnx.export(*args, **kwargs)
 
-def make_conv_transpose():
-    """ConvTranspose + Relu — mask upscaling path.
 
-    Decoder output_upscaling:
-      ConvTranspose2d(256→64, k=2, s=2) → Relu
-      ConvTranspose2d(64→32,  k=2, s=2) → Relu
+# ============================================================
+# Part 1: Prompt Encoding
+# ============================================================
+
+class Part1_PromptEncoding(nn.Module):
+    """point_coords + point_labels -> sparse_embedding.
+
+    Replicates SamCoreMLModel._embed_points: positional encoding (sin/cos),
+    label comparison (equal/not/cast), and per-label embedding selection.
     """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 256, 64, 64])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 32, 256, 256])
 
-    W1 = numpy_helper.from_array(
-        np.random.randn(256, 64, 2, 2).astype(np.float32) * 0.01, "w1")
-    B1 = numpy_helper.from_array(np.zeros(64, dtype=np.float32), "b1")
-    W2 = numpy_helper.from_array(
-        np.random.randn(64, 32, 2, 2).astype(np.float32) * 0.01, "w2")
-    B2 = numpy_helper.from_array(np.zeros(32, dtype=np.float32), "b2")
+    def __init__(self, sam):
+        super().__init__()
+        self.pe_layer = sam.prompt_encoder.pe_layer
+        self.point_embeddings = sam.prompt_encoder.point_embeddings
+        self.not_a_point_embed = sam.prompt_encoder.not_a_point_embed
+        self.num_point_embeddings = sam.prompt_encoder.num_point_embeddings
+        self.img_size = sam.image_encoder.img_size
 
-    nodes = [
-        helper.make_node("ConvTranspose", ["input", "w1", "b1"], ["h1"],
-                         kernel_shape=[2, 2], strides=[2, 2]),
-        helper.make_node("Relu", ["h1"], ["h2"]),
-        helper.make_node("ConvTranspose", ["h2", "w2", "b2"], ["h3"],
-                         kernel_shape=[2, 2], strides=[2, 2]),
-        helper.make_node("Relu", ["h3"], ["output"]),
-    ]
+    def forward(self, point_coords, point_labels):
+        point_coords = point_coords + 0.5
+        point_coords = point_coords / self.img_size
+        point_embedding = self.pe_layer._pe_encoding(point_coords)
+        point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding)
 
-    return _build_model("conv_transpose_test", nodes, [X], [Y], [W1, B1, W2, B2])
+        point_embedding = point_embedding * (point_labels != -1)
+        point_embedding = point_embedding + \
+            self.not_a_point_embed.weight * (point_labels == -1)
+
+        for i in range(self.num_point_embeddings):
+            point_embedding = point_embedding + \
+                self.point_embeddings[i].weight * (point_labels == i)
+
+        return point_embedding
 
 
-def make_bool_logic():
-    """Equal + Not + Cast(bool→float) — prompt label comparison.
+# ============================================================
+# Part 2: Transformer
+# ============================================================
 
-    _embed_points does:
-      point_embedding *= (point_labels != -1)
-      point_embedding += embed[i] * (point_labels == i)
+class Part2_Transformer(nn.Module):
+    """image_embeddings + sparse_embedding -> (hs, src).
+
+    Wraps token preparation (iou_token/mask_tokens concatenation) and the
+    full TwoWayTransformer (2x attention blocks + final attention + LayerNorm).
+    Dense embedding and image PE are baked in as constant buffers.
     """
-    labels = helper.make_tensor_value_info(
-        "labels", TensorProto.FLOAT, [1, 5, 256])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 5, 256])
 
-    neg_one = numpy_helper.from_array(np.array(-1.0, dtype=np.float32), "neg_one")
-    zero_f = numpy_helper.from_array(np.array(0.0, dtype=np.float32), "zero_f")
+    def __init__(self, sam):
+        super().__init__()
+        self.transformer = sam.mask_decoder.transformer
+        self.iou_token = sam.mask_decoder.iou_token
+        self.mask_tokens = sam.mask_decoder.mask_tokens
+        # These become ONNX constants (no dependency on inputs)
+        self.register_buffer(
+            'dense_embedding',
+            sam.prompt_encoder.no_mask_embed.weight.reshape(1, -1, 1, 1).clone()
+        )
+        self.register_buffer(
+            'image_pe',
+            sam.prompt_encoder.get_dense_pe().clone()
+        )
 
-    nodes = [
-        # (labels == -1)
-        helper.make_node("Equal", ["labels", "neg_one"], ["eq_neg1"]),
-        # !(labels == -1)
-        helper.make_node("Not", ["eq_neg1"], ["neq_neg1"]),
-        # cast bool → float
-        helper.make_node("Cast", ["neq_neg1"], ["mask_f"], to=TensorProto.FLOAT),
-        # (labels == 0)
-        helper.make_node("Equal", ["labels", "zero_f"], ["eq_zero"]),
-        helper.make_node("Cast", ["eq_zero"], ["mask0_f"], to=TensorProto.FLOAT),
-        # combine
-        helper.make_node("Add", ["mask_f", "mask0_f"], ["output"]),
-    ]
+    def forward(self, image_embeddings, sparse_embedding):
+        # Token preparation (from MaskDecoder.predict_masks)
+        output_tokens = torch.cat(
+            [self.iou_token.weight, self.mask_tokens.weight], dim=0
+        )
+        output_tokens = output_tokens.unsqueeze(0).expand(
+            sparse_embedding.size(0), -1, -1
+        )
+        tokens = torch.cat((output_tokens, sparse_embedding), dim=1)
 
-    return _build_model("bool_logic_test", nodes, [labels], [Y], [neg_one, zero_f])
+        src = image_embeddings + self.dense_embedding
+
+        # Run the two-way transformer
+        hs, src = self.transformer(src, self.image_pe, tokens)
+        return hs, src
 
 
-def make_gather():
-    """Gather — embedding table lookup.
+# ============================================================
+# Part 3: Mask Head
+# ============================================================
 
-    prompt_encoder.point_embeddings[i].weight selected by label index.
-    Uses int64 indices (converted to int32 by our pipeline).
+class Part3_MaskHead(nn.Module):
+    """(hs, src) -> (scores, masks).
+
+    Wraps output upscaling (ConvTranspose + LayerNorm2d + GELUManual),
+    hypernetwork MLPs, mask generation via matrix multiply, and
+    stability score computation.
     """
-    table = helper.make_tensor_value_info("table", TensorProto.FLOAT, [5, 256])
-    indices = helper.make_tensor_value_info("indices", TensorProto.INT64, [1, 3])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 256])
 
-    nodes = [
-        helper.make_node("Gather", ["table", "indices"], ["output"], axis=0),
-    ]
+    def __init__(self, sam):
+        super().__init__()
+        md = sam.mask_decoder
+        self.output_upscaling = md.output_upscaling
+        self.output_hypernetworks_mlps = md.output_hypernetworks_mlps
+        self.iou_prediction_head = md.iou_prediction_head
+        self.num_mask_tokens = md.num_mask_tokens
+        self.mask_threshold = sam.mask_threshold
+        self.stability_score_offset = 1.0
 
-    return _build_model("gather_test", nodes, [table, indices], [Y])
+    def forward(self, hs, src):
+        # Extract tokens from transformer output
+        iou_token_out = hs[:, 0, :]
+        mask_tokens_out = hs[:, 1:(1 + self.num_mask_tokens), :]
 
+        # Reshape src back to spatial: (B, 4096, 256) -> (B, 256, 64, 64)
+        b = src.shape[0]
+        src = src.transpose(1, 2).view(b, 256, 64, 64)
 
-def make_tile_expand():
-    """Tile + Expand + Unsqueeze — prompt broadcasting.
+        # Upscale mask embeddings: (B, 256, 64, 64) -> (B, 32, 256, 256)
+        upscaled = self.output_upscaling(src)
 
-    point_labels.unsqueeze(-1).expand_as(point_embedding) and
-    dense embedding spatial broadcast both use these ops.
-    """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 5])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 5, 256])
+        # Hypernetwork MLPs: each (B, 256) -> (B, 32)
+        hyper_in_list = []
+        for i in range(self.num_mask_tokens):
+            hyper_in_list.append(
+                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
+            )
+        hyper_in = torch.stack(hyper_in_list, dim=1)
 
-    # int64 for ONNX spec, will be converted to int32
-    repeats = numpy_helper.from_array(
-        np.array([1, 1, 256], dtype=np.int64), "repeats")
-    shape = numpy_helper.from_array(
-        np.array([1, 5, 256], dtype=np.int64), "shape")
+        # Generate masks: (B, num_masks, 32) @ (B, 32, H*W) -> (B, num_masks, H, W)
+        b, c, h, w = upscaled.shape
+        masks = (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w)
 
-    nodes = [
-        # Unsqueeze: (1,5) → (1,5,1)   [opset 11: axes is attribute]
-        helper.make_node("Unsqueeze", ["input"], ["unsq"], axes=[2]),
-        # Tile: (1,5,1) → (1,5,256)
-        helper.make_node("Tile", ["unsq", "repeats"], ["tiled"]),
-        # Expand: (1,5,1) → (1,5,256)
-        helper.make_node("Expand", ["unsq", "shape"], ["expanded"]),
-        # Combine to keep both paths
-        helper.make_node("Add", ["tiled", "expanded"], ["output"]),
-    ]
+        # IoU prediction (unused in stability-score mode, but still in graph)
+        _iou_pred = self.iou_prediction_head(iou_token_out)
 
-    return _build_model("tile_expand_test", nodes, [X], [Y], [repeats, shape])
+        # Stability score (int32, matching NPU export pipeline)
+        intersections = (
+            (masks > (self.mask_threshold + self.stability_score_offset))
+            .sum(-1, dtype=torch.int32)
+            .sum(-1, dtype=torch.int32)
+        )
+        unions = (
+            (masks > (self.mask_threshold - self.stability_score_offset))
+            .sum(-1, dtype=torch.int32)
+            .sum(-1, dtype=torch.int32)
+        )
+        scores = intersections / unions
 
-
-def make_attention():
-    """MatMul + Softmax + Transpose + Reshape + Slice — transformer attention.
-
-    TwoWayTransformer: multi-head attention with head reshape/transpose,
-    plus Slice for extracting mask/IoU tokens from output.
-
-    Shapes match decoder: 10 query tokens, 4096 (=64*64) key/value tokens,
-    8 heads, head_dim=32, embed_dim=256.
-    """
-    Q_in = helper.make_tensor_value_info("q", TensorProto.FLOAT, [1, 10, 256])
-    K_in = helper.make_tensor_value_info("k", TensorProto.FLOAT, [1, 4096, 256])
-    V_in = helper.make_tensor_value_info("v", TensorProto.FLOAT, [1, 4096, 256])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 5, 256])
-
-    # Reshape targets (int64 → will be int32 after conversion)
-    q_shape = numpy_helper.from_array(
-        np.array([1, 10, 8, 32], dtype=np.int64), "q_shape")
-    kv_shape = numpy_helper.from_array(
-        np.array([1, 4096, 8, 32], dtype=np.int64), "kv_shape")
-    out_shape = numpy_helper.from_array(
-        np.array([1, 10, 256], dtype=np.int64), "out_shape")
-    scale = numpy_helper.from_array(
-        np.array(1.0 / np.sqrt(32), dtype=np.float32), "scale")
-
-    # Slice params: extract first 5 tokens (like mask tokens)
-    sl_starts = numpy_helper.from_array(np.array([0], dtype=np.int64), "sl_starts")
-    sl_ends = numpy_helper.from_array(np.array([5], dtype=np.int64), "sl_ends")
-    sl_axes = numpy_helper.from_array(np.array([1], dtype=np.int64), "sl_axes")
-
-    nodes = [
-        # Reshape to multi-head: (B, N, 8, 32)
-        helper.make_node("Reshape", ["q", "q_shape"], ["q4"]),
-        helper.make_node("Reshape", ["k", "kv_shape"], ["k4"]),
-        helper.make_node("Reshape", ["v", "kv_shape"], ["v4"]),
-        # Transpose to (B, 8, N, 32)
-        helper.make_node("Transpose", ["q4"], ["qt"], perm=[0, 2, 1, 3]),
-        helper.make_node("Transpose", ["k4"], ["kt"], perm=[0, 2, 3, 1]),
-        helper.make_node("Transpose", ["v4"], ["vt"], perm=[0, 2, 1, 3]),
-        # Attention: softmax(Q @ K^T / sqrt(d)) @ V
-        helper.make_node("MatMul", ["qt", "kt"], ["qk"]),
-        helper.make_node("Mul", ["qk", "scale"], ["qk_s"]),
-        helper.make_node("Softmax", ["qk_s"], ["attn"], axis=-1),
-        helper.make_node("MatMul", ["attn", "vt"], ["attn_out"]),
-        # Transpose back: (B, 8, N, 32) → (B, N, 8, 32)
-        helper.make_node("Transpose", ["attn_out"], ["attn_t"], perm=[0, 2, 1, 3]),
-        # Reshape to (B, N, 256)
-        helper.make_node("Reshape", ["attn_t", "out_shape"], ["merged"]),
-        # Slice: extract first 5 tokens (mask/IoU token extraction)
-        helper.make_node("Slice", ["merged", "sl_starts", "sl_ends", "sl_axes"],
-                         ["output"]),
-    ]
-
-    return _build_model(
-        "attention_test", nodes, [Q_in, K_in, V_in], [Y],
-        [q_shape, kv_shape, out_shape, scale, sl_starts, sl_ends, sl_axes])
+        return scores, masks
 
 
-def make_layernorm():
-    """ReduceMean + Sub + Pow + Sqrt + Div — decomposed LayerNorm.
+# ============================================================
+# Export helper
+# ============================================================
 
-    opset 11 decomposes nn.LayerNorm into these primitive ops.
-    9 LayerNorm instances in the decoder's TwoWayTransformer.
-    """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 10, 256])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 10, 256])
+def export_part(module, dummy_inputs, input_names, output_names, path, desc):
+    print(f"\n{'=' * 60}")
+    print(f"  {desc}")
+    print(f"{'=' * 60}")
 
-    gamma = numpy_helper.from_array(np.ones(256, dtype=np.float32), "gamma")
-    beta = numpy_helper.from_array(np.zeros(256, dtype=np.float32), "beta")
-    eps = numpy_helper.from_array(np.array(1e-5, dtype=np.float32), "eps")
-    two = numpy_helper.from_array(np.array(2.0, dtype=np.float32), "two")
+    _onnx_export(
+        module, dummy_inputs, path,
+        input_names=input_names,
+        output_names=output_names,
+        opset_version=11,
+        verbose=False,
+    )
+    print(f"  Exported to {path}")
 
-    nodes = [
-        # mean = ReduceMean(x, axis=-1)
-        helper.make_node("ReduceMean", ["input"], ["mean"],
-                         axes=[-1], keepdims=1),
-        # centered = x - mean
-        helper.make_node("Sub", ["input", "mean"], ["centered"]),
-        # var = ReduceMean(centered^2, axis=-1)
-        helper.make_node("Pow", ["centered", "two"], ["sq"]),
-        helper.make_node("ReduceMean", ["sq"], ["var"],
-                         axes=[-1], keepdims=1),
-        # std = sqrt(var + eps)
-        helper.make_node("Add", ["var", "eps"], ["var_eps"]),
-        helper.make_node("Sqrt", ["var_eps"], ["std"]),
-        # normalized = centered / std
-        helper.make_node("Div", ["centered", "std"], ["normed"]),
-        # output = gamma * normalized + beta
-        helper.make_node("Mul", ["normed", "gamma"], ["scaled"]),
-        helper.make_node("Add", ["scaled", "beta"], ["output"]),
-    ]
-
-    return _build_model("layernorm_test", nodes, [X], [Y],
-                        [gamma, beta, eps, two])
+    simplify_onnx(path)
+    convert_int64_to_int32(path)
+    print_summary(path)
 
 
-def make_sincos_pe():
-    """Sin + Cos + Concat — positional encoding.
-
-    pe_layer._pe_encoding: coords → sin/cos features → concat.
-    """
-    X = helper.make_tensor_value_info("coords", TensorProto.FLOAT, [1, 5, 128])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 5, 256])
-
-    freq = numpy_helper.from_array(
-        np.random.randn(128).astype(np.float32) * 6.2832, "freq")
-
-    nodes = [
-        helper.make_node("Mul", ["coords", "freq"], ["scaled"]),
-        helper.make_node("Sin", ["scaled"], ["sin_out"]),
-        helper.make_node("Cos", ["scaled"], ["cos_out"]),
-        helper.make_node("Concat", ["sin_out", "cos_out"], ["output"], axis=-1),
-    ]
-
-    return _build_model("sincos_pe_test", nodes, [X], [Y], [freq])
-
-
-def make_gemm_tanh():
-    """Gemm + Tanh — MLP / fully-connected layers.
-
-    TwoWayAttentionBlock MLP: Linear → GELU(tanh) → Linear.
-    GELUManual uses Tanh as its core nonlinearity.
-    """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [10, 256])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [10, 256])
-
-    W1 = numpy_helper.from_array(
-        np.random.randn(256, 1024).astype(np.float32) * 0.01, "w1")
-    B1 = numpy_helper.from_array(np.zeros(1024, dtype=np.float32), "b1")
-    W2 = numpy_helper.from_array(
-        np.random.randn(1024, 256).astype(np.float32) * 0.01, "w2")
-    B2 = numpy_helper.from_array(np.zeros(256, dtype=np.float32), "b2")
-
-    nodes = [
-        helper.make_node("Gemm", ["input", "w1", "b1"], ["h1"]),
-        helper.make_node("Tanh", ["h1"], ["h2"]),
-        helper.make_node("Gemm", ["h2", "w2", "b2"], ["output"]),
-    ]
-
-    return _build_model("gemm_tanh_test", nodes, [X], [Y], [W1, B1, W2, B2])
-
-
-# ------------------------------------------------------------------
-# Registry
-# ------------------------------------------------------------------
-
-TEST_MODELS = [
-    ("01_conv_transpose", "ConvTranspose, Relu",
-     make_conv_transpose),
-    ("02_bool_logic",     "Equal, Not, Cast",
-     make_bool_logic),
-    ("03_gather",         "Gather",
-     make_gather),
-    ("04_tile_expand",    "Tile, Expand, Unsqueeze",
-     make_tile_expand),
-    ("05_attention",      "MatMul, Softmax, Transpose, Reshape, Slice, Mul",
-     make_attention),
-    ("06_layernorm",      "ReduceMean, Sub, Pow, Sqrt, Div, Add, Mul",
-     make_layernorm),
-    ("07_sincos_pe",      "Sin, Cos, Concat, Mul",
-     make_sincos_pe),
-    ("08_gemm_tanh",      "Gemm, Tanh",
-     make_gemm_tanh),
-]
-
-
-# ------------------------------------------------------------------
+# ============================================================
 # Main
-# ------------------------------------------------------------------
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate minimal ONNX models to diagnose NPU operator support.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Export 3 decoder sub-modules for NPU compilation diagnosis."
+    )
+    parser.add_argument(
+        "checkpoint", type=str,
+        help="Path to EdgeSAM checkpoint (.pth)",
     )
     parser.add_argument(
         "--output-dir", type=str, default="./npu_diag",
         help="Directory for generated .onnx files (default: ./npu_diag)",
     )
+    parser.add_argument(
+        "--num-points", type=int, default=5,
+        help="Number of prompt points (default: 5, must match decoder export)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    N = args.num_points
 
-    print("Generating diagnostic ONNX models (opset %d, int32-only)..." % OPSET)
-    print("=" * 64)
+    # Load model
+    print("Loading model...")
+    sam = sam_model_registry["edge_sam"](
+        checkpoint=args.checkpoint, upsample_mode="bilinear"
+    )
+    sam.eval()
 
-    for filename, ops_desc, builder in TEST_MODELS:
-        model = builder()
-        path = os.path.join(args.output_dir, filename + ".onnx")
-        onnx.save(model, path)
+    # Apply NPU fixes to the model
+    n_gelu = replace_gelu(sam)
+    print(f"Replaced {n_gelu} nn.GELU -> GELUManual (tanh approximation)")
 
-        actual_ops = _list_ops(model)
-        print("  %-24s  %s" % (filename + ".onnx", ops_desc))
-        print("  %-24s  actual ops: %s" % ("", ", ".join(actual_ops)))
-        print()
+    num_mask_tokens = sam.mask_decoder.num_mask_tokens  # 4
+    num_output_tokens = 1 + num_mask_tokens  # iou + masks = 5
+    total_tokens = num_output_tokens + N  # 5 + N = 10
 
-    print("=" * 64)
-    print("Generated %d models in %s/" % (len(TEST_MODELS), args.output_dir))
+    # --- Part 1: Prompt Encoding ---
+    part1 = Part1_PromptEncoding(sam).eval()
+    with torch.no_grad():
+        export_part(
+            part1,
+            (torch.randint(0, 1024, (1, N, 2), dtype=torch.float),
+             torch.randint(0, 4, (1, N), dtype=torch.float)),
+            ["point_coords", "point_labels"],
+            ["sparse_embedding"],
+            os.path.join(args.output_dir, "part1_prompt_encoding.onnx"),
+            "Part 1: Prompt Encoding",
+        )
+
+    # --- Part 2: Transformer ---
+    part2 = Part2_Transformer(sam).eval()
+    with torch.no_grad():
+        export_part(
+            part2,
+            (torch.randn(1, 256, 64, 64),
+             torch.randn(1, N, 256)),
+            ["image_embeddings", "sparse_embedding"],
+            ["hs", "src"],
+            os.path.join(args.output_dir, "part2_transformer.onnx"),
+            "Part 2: Transformer (2x TwoWayAttentionBlock + final attn)",
+        )
+
+    # --- Part 3: Mask Head ---
+    part3 = Part3_MaskHead(sam).eval()
+    with torch.no_grad():
+        export_part(
+            part3,
+            (torch.randn(1, total_tokens, 256),
+             torch.randn(1, 4096, 256)),
+            ["hs", "src"],
+            ["scores", "masks"],
+            os.path.join(args.output_dir, "part3_mask_head.onnx"),
+            "Part 3: Mask Head (upscaling + MLPs + stability score)",
+        )
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print(f"Generated 3 models in {args.output_dir}/")
     print()
-    print("Next steps:")
-    print("  1. Compile each .onnx with your NPU toolchain")
-    print("  2. Record PASS / FAIL for each model")
-    print("  3. Failed models identify the problematic operator group(s)")
+    print("  part1_prompt_encoding.onnx  — Sin/Cos PE, label comparison")
+    print("  part2_transformer.onnx      — Attention, LayerNorm, MLP")
+    print("  part3_mask_head.onnx        — ConvTranspose, upscaling, scores")
     print()
-    print("If a group fails, you can further isolate by editing this script")
-    print("to split that group into individual single-operator models.")
+    print("Compile each with your NPU toolchain and report PASS/FAIL.")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
