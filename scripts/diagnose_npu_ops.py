@@ -100,12 +100,13 @@ class Part1_PromptEncoding(nn.Module):
 
     @staticmethod
     def _float_eq(x, val):
-        """NPU-safe equality mask using pure float ops (no Equal/Cast).
+        """NPU-safe equality mask using pure float ops (no Equal/Cast/Abs).
 
-        For integer-valued floats: clamp(1 - abs(x - val), 0, 1) == 1.0
-        when x == val, 0.0 otherwise.  Only emits Sub, Abs, Clamp, Mul.
+        For integer-valued floats: relu(1 - (x-val)^2) == 1.0 when x == val,
+        0.0 otherwise.  Only emits Sub, Mul, Sub, Relu — no Abs or Clip.
         """
-        return torch.clamp(1.0 - torch.abs(x - val), min=0.0, max=1.0)
+        diff = x - val
+        return torch.relu(1.0 - diff * diff)
 
     def forward(self, point_coords, point_labels):
         point_coords = point_coords + 0.5
@@ -244,27 +245,28 @@ class Part3_MaskHead(nn.Module):
 
     def forward(self, hs, src):
         # Extract tokens from transformer output
-        iou_token_out = hs[:, 0, :]
+        # Use slice + reshape instead of integer index (Slice+Reshape instead of Gather)
+        iou_token_out = hs[:, 0:1, :].reshape(1, 256)
         mask_tokens_out = hs[:, 1:(1 + self.num_mask_tokens), :]
 
         # Reshape src back to spatial: (B, 4096, 256) -> (B, 256, 64, 64)
-        b = src.shape[0]
-        src = src.transpose(1, 2).view(b, 256, 64, 64)
+        src = src.transpose(1, 2).reshape(1, 256, 64, 64)
 
         # Upscale mask embeddings: (B, 256, 64, 64) -> (B, 32, 256, 256)
         upscaled = self.output_upscaling(src)
 
         # Hypernetwork MLPs: each (B, 256) -> (B, 32)
+        # Use slice + reshape instead of integer index (Slice+Reshape instead of Gather)
         hyper_in_list = []
         for i in range(self.num_mask_tokens):
+            token_i = mask_tokens_out[:, i:i+1, :].reshape(1, 256)
             hyper_in_list.append(
-                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
+                self.output_hypernetworks_mlps[i](token_i)
             )
         hyper_in = torch.stack(hyper_in_list, dim=1)
 
         # Generate masks: (B, num_masks, 32) @ (B, 32, H*W) -> (B, num_masks, H, W)
-        b, c, h, w = upscaled.shape
-        masks = (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w)
+        masks = (hyper_in @ upscaled.reshape(1, 32, 65536)).reshape(1, -1, 256, 256)
 
         # IoU prediction
         _iou_pred = self.iou_prediction_head(iou_token_out)
