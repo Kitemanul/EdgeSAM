@@ -36,6 +36,44 @@ parser.add_argument(
     help="If set, export decoder, otherwise export encoder",
 )
 
+parser.add_argument(
+    "--fix-cast-int64",
+    action="store_true",
+    help=(
+        "Convert Cast nodes targeting int64/int16 to int32. "
+        "Required for compilers that do not support int64 (e.g. circle quantizer)."
+    ),
+)
+
+
+def fix_cast_int64(onnx_path):
+    """Convert Cast nodes targeting int64/int16 to Cast→int32.
+
+    Some hardware compilers (e.g. circle quantizer) only support int32 and
+    will error on Cast→int64 nodes. This converts only the Cast node target
+    types, keeping the rest of the graph intact.
+    """
+    import onnx
+    from onnx import TensorProto, shape_inference
+
+    model = onnx.load(onnx_path)
+    convertible = {TensorProto.INT64, TensorProto.INT16}
+    count = 0
+
+    for node in model.graph.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i in convertible:
+                    attr.i = TensorProto.INT32
+                    count += 1
+
+    if count > 0:
+        del model.graph.value_info[:]
+        model = shape_inference.infer_shapes(model)
+        onnx.save(model, onnx_path)
+
+    print(f"  Fixed {count} Cast node(s): int64/int16 → int32")
+
 
 def export_encoder_to_onnx(sam, args):
     if args.gelu_approximate:
@@ -107,6 +145,9 @@ def export_decoder_to_onnx(sam, args):
     )
 
     print(f"Exported ONNX decoder model to {onnx_decoder_filename}")
+
+    if args.fix_cast_int64:
+        fix_cast_int64(onnx_decoder_filename)
 
 
 if __name__ == "__main__":
