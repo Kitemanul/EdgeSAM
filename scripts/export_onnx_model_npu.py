@@ -15,7 +15,6 @@ Usage:
 
 import torch
 import argparse
-import numpy as np
 from edge_sam import sam_model_registry
 from edge_sam.utils.coreml import SamCoreMLModel
 
@@ -100,16 +99,23 @@ class SamCoreMLModelNPU(SamCoreMLModel):
 # ============================================================
 
 def fix_dtypes_for_npu(onnx_path):
-    """Convert ALL int16 and int64 → int32, then re-infer shapes.
+    """Convert only Cast→int64/int16 nodes to Cast→int32, then re-infer.
 
-    Selective conversion (keeping some int64) creates type mismatches
-    that cause MLIR assertion failures in onnx2circle.  Converting
-    everything uniformly and running shape inference keeps the graph
-    self-consistent.  Circle/TFLite uses int32 for shapes internally,
-    so int32 Reshape/Slice inputs are fine.
+    The ONNX graph has two distinct sources of int64:
+
+    1. **Shape ops** (Shape, Gather-on-shape, Concat, etc.) – these form a
+       self-consistent int64 subgraph that feeds Reshape/Slice shape inputs.
+       They must stay int64 (ONNX spec requires int64 for Reshape shape).
+
+    2. **Explicit Cast→int64** from ``.to(torch.long)`` – this feeds Gather
+       indices and Reshape *data* inputs.  Safe to convert to int32.
+
+    Converting *only* Cast nodes keeps the shape subgraph fully int64 (no
+    type mismatch in Concat/Unsqueeze chains), while removing the Cast→int64
+    that NPU quantizers cannot handle.
     """
     import onnx
-    from onnx import TensorProto, numpy_helper, shape_inference
+    from onnx import TensorProto, shape_inference
 
     model = onnx.load(onnx_path)
     INT64 = TensorProto.INT64
@@ -118,7 +124,8 @@ def fix_dtypes_for_npu(onnx_path):
     convertible = {INT64, INT16}
     count = 0
 
-    # --- Cast nodes ---
+    # Only touch Cast nodes – Constants, Initializers, and Shape-op outputs
+    # stay int64 so the shape-computation subgraph remains self-consistent.
     for node in model.graph.node:
         if node.op_type == "Cast":
             for attr in node.attribute:
@@ -126,34 +133,14 @@ def fix_dtypes_for_npu(onnx_path):
                     attr.i = INT32
                     count += 1
 
-    # --- Constant nodes ---
-    for node in model.graph.node:
-        if node.op_type == "Constant":
-            for attr in node.attribute:
-                if attr.name == "value" and attr.t and attr.t.data_type in convertible:
-                    arr = numpy_helper.to_array(attr.t).astype(np.int32)
-                    attr.t.CopyFrom(numpy_helper.from_array(arr))
-                    count += 1
+    # Clear stale value_info so shape inference re-derives all types
+    # from the modified Cast nodes and the unchanged int64 Constants.
+    del model.graph.value_info[:]
 
-    # --- Initializers ---
-    for init in model.graph.initializer:
-        if init.data_type in convertible:
-            arr = numpy_helper.to_array(init).astype(np.int32)
-            new_init = numpy_helper.from_array(arr, name=init.name)
-            init.CopyFrom(new_init)
-            count += 1
-
-    # --- Graph inputs / outputs / value_info ---
-    for vi in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
-        if vi.type.tensor_type.elem_type in convertible:
-            vi.type.tensor_type.elem_type = INT32
-            count += 1
-
-    # Re-infer shapes so all type annotations are self-consistent
     model = shape_inference.infer_shapes(model)
 
     onnx.save(model, onnx_path)
-    print(f"  Converted {count} int16/int64 → int32 occurrences (+ shape inference)")
+    print(f"  Converted {count} Cast node(s) to int32 (+ shape inference)")
 
 
 # ============================================================
