@@ -83,11 +83,11 @@ class Part1_PromptEncoding(nn.Module):
     """point_coords + point_labels -> sparse_embedding.
 
     Replicates SamCoreMLModel._embed_points: positional encoding (sin/cos),
-    label comparison (equal/not/cast), and per-label embedding selection.
+    label comparison, and per-label embedding selection.
 
-    NPU-friendly: all boolean masks are explicitly cast to float32 before
-    arithmetic, and != is replaced with (1 - equal_mask) to avoid the
-    ONNX Not operator.
+    NPU-friendly: all label masks are computed via pure float arithmetic
+    (Sub, Abs, Clamp) instead of Equal/Cast(bool), avoiding any boolean
+    tensor ops that NPU compilers may not support.
     """
 
     def __init__(self, sam):
@@ -98,14 +98,23 @@ class Part1_PromptEncoding(nn.Module):
         self.num_point_embeddings = sam.prompt_encoder.num_point_embeddings
         self.img_size = sam.image_encoder.img_size
 
+    @staticmethod
+    def _float_eq(x, val):
+        """NPU-safe equality mask using pure float ops (no Equal/Cast).
+
+        For integer-valued floats: clamp(1 - abs(x - val), 0, 1) == 1.0
+        when x == val, 0.0 otherwise.  Only emits Sub, Abs, Clamp, Mul.
+        """
+        return torch.clamp(1.0 - torch.abs(x - val), min=0.0, max=1.0)
+
     def forward(self, point_coords, point_labels):
         point_coords = point_coords + 0.5
         point_coords = point_coords / self.img_size
         point_embedding = self.pe_layer._pe_encoding(point_coords)
         point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding)
 
-        # NPU-safe: explicit float32 cast, avoid Not operator
-        mask_neg1 = (point_labels == -1).to(torch.float32)
+        # NPU-safe: pure float arithmetic masks (no Equal, Not, Cast)
+        mask_neg1 = self._float_eq(point_labels, -1.0)
         mask_not_neg1 = 1.0 - mask_neg1
 
         point_embedding = point_embedding * mask_not_neg1
@@ -113,7 +122,7 @@ class Part1_PromptEncoding(nn.Module):
             self.not_a_point_embed.weight * mask_neg1
 
         for i in range(self.num_point_embeddings):
-            mask_i = (point_labels == i).to(torch.float32)
+            mask_i = self._float_eq(point_labels, float(i))
             point_embedding = point_embedding + \
                 self.point_embeddings[i].weight * mask_i
 
@@ -165,6 +174,28 @@ class Part2_Transformer(nn.Module):
 
 
 # ============================================================
+# NPU-safe GELU (tanh approximation, avoids Erf op)
+# ============================================================
+
+class _GELUTanh(nn.Module):
+    """GELU via tanh approximation. Avoids the Erf ONNX op."""
+
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(
+            0.7978845608028654 * (x + 0.044715 * x * x * x)
+        ))
+
+
+def _replace_gelu(module):
+    """Replace all nn.GELU in a module tree with _GELUTanh."""
+    for attr in list(module._modules.keys()):
+        if isinstance(module._modules[attr], nn.GELU):
+            module._modules[attr] = _GELUTanh()
+        else:
+            _replace_gelu(module._modules[attr])
+
+
+# ============================================================
 # Part 3: Mask Head
 # ============================================================
 
@@ -174,6 +205,10 @@ class Part3_MaskHead(nn.Module):
     Wraps output upscaling (ConvTranspose + LayerNorm2d + GELU),
     hypernetwork MLPs, mask generation via matrix multiply, and
     stability score computation.
+
+    NPU fixes applied:
+    - nn.GELU replaced with tanh approximation (avoids Erf op)
+    - Stability score uses float arithmetic instead of bool ops
     """
 
     def __init__(self, sam):
@@ -186,25 +221,25 @@ class Part3_MaskHead(nn.Module):
         self.mask_threshold = sam.mask_threshold
         self.stability_score_offset = 1.0
 
+        # Replace nn.GELU -> tanh approximation (eliminates Erf op)
+        _replace_gelu(self.output_upscaling)
+
     @staticmethod
     def _stability_score_npu(masks, mask_threshold, threshold_offset):
-        """NPU-friendly stability score: cast bool->float32 before ReduceSum.
+        """NPU-friendly stability score using pure float ops.
 
-        The original calculate_stability_score uses bool.sum(dtype=int16)
-        which emits ReduceSum on bool type — unsupported by LUCI interpreter.
+        Avoids both:
+        - ReduceSum on bool (LUCI "Sum unsupported type")
+        - Greater/Cast(bool) pattern (compilation failure)
+
+        Uses sigmoid step approximation: sigmoid(k*(x - t)) ≈ step(x - t)
+        with large k, producing only float Mul/Add/Sigmoid/ReduceSum ops.
         """
-        intersections = (
-            (masks > (mask_threshold + threshold_offset))
-            .to(torch.float32)
-            .sum(-1)
-            .sum(-1)
-        )
-        unions = (
-            (masks > (mask_threshold - threshold_offset))
-            .to(torch.float32)
-            .sum(-1)
-            .sum(-1)
-        )
+        k = 50.0  # steepness — large enough for near-binary output
+        high = torch.sigmoid(k * (masks - (mask_threshold + threshold_offset)))
+        low = torch.sigmoid(k * (masks - (mask_threshold - threshold_offset)))
+        intersections = high.sum(-1).sum(-1)
+        unions = low.sum(-1).sum(-1)
         return intersections / unions
 
     def forward(self, hs, src):
