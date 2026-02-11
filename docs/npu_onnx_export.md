@@ -31,24 +31,23 @@ EdgeSAM 的 ONNX decoder 在 TV NPU 编译器上编译失败。根因是 decoder
 
 ### 概述
 
-针对 NPU 编译器做了 **5 项修复**，分为两个阶段：
+针对 NPU 编译器做了 **4 项修复**，分为两个阶段：
 
 ```
 阶段 1：PyTorch 侧（导出前）            阶段 2：ONNX 侧（导出后）
 ┌─────────────────────────────┐    ┌──────────────────────────────────┐
-│ ① nn.GELU → tanh 近似       │    │ ④ onnxruntime 图简化（常量折叠）   │
-│ ② stability_score int16→int32│    │ ⑤ int64/int16 → int32 全量转换    │
-│ ③ OneHot → Gather 查表       │    │    （7 处位置，无 Cast 桥接）       │
-│    + 去掉 dynamic_axes       │    │                                  │
+│ ① nn.GELU → tanh 近似       │    │ ③ onnxruntime 图简化（常量折叠）   │
+│ ② stability_score int16→int32│    │ ④ int64/int16 → int32 全量转换    │
+│    + 去掉 dynamic_axes       │    │    （7 处位置，无 Cast 桥接）       │
 └─────────────────────────────┘    └──────────────────────────────────┘
 ```
 
 > **关于 nn.LayerNorm**：在 opset >= 17 时会导出为 `LayerNormalization` 原生算子，
 > NPU 不支持。但本脚本使用 **opset 11**，PyTorch exporter 会自动将 LayerNorm 分解为
 > ReduceMean/Sub/Pow/Sqrt/Div/Mul/Add 基本算子，因此**无需手动替换**。
-> 如果未来需要更高 opset，参考下方「修复 ①（参考）」一节。
+> 如果未来需要更高 opset，参考下方「修复（参考）」一节。
 
-### 修复 ①（参考）：nn.LayerNorm → LayerNormManual
+### 修复（参考）：nn.LayerNorm → LayerNormManual
 
 > **注意**：当前脚本使用 opset 11，PyTorch 会自动分解 LayerNorm，因此**无需此修复**。
 > 此节仅作参考，供未来使用更高 opset 时使用。
@@ -115,7 +114,7 @@ manual.bias = module.bias
 
 ---
 
-### 修复 ②：nn.GELU → GELUManual（tanh 近似）
+### 修复 ①：nn.GELU → GELUManual（tanh 近似）
 
 **问题**：`nn.GELU` 使用 `erf` 函数，导出到 ONNX 生成 `Erf` 算子。NPU 编译器不支持 `Erf`，且**不会因降低 opset 版本而自动分解**。
 
@@ -181,7 +180,7 @@ erf(...)       → Erf  ← 不支持   0.044715 * x³ → Mul
 
 ---
 
-### 修复 ③：stability_score int16 → int32 + 去掉 dynamic_axes
+### 修复 ②：stability_score int16 → int32 + 去掉 dynamic_axes
 
 **问题 A：int16**
 
@@ -211,7 +210,7 @@ intersections = (
 
 ---
 
-### 修复 ④：onnxruntime 图简化（常量折叠）
+### 修复 ③：onnxruntime 图简化（常量折叠）
 
 **问题**：即使是固定 shape 导出，PyTorch ONNX exporter 仍然生成大量 shape 计算子图：
 
@@ -236,7 +235,7 @@ ort.InferenceSession(onnx_path, sess_options)
 
 ---
 
-### 修复 ⑤：int64/int16 → int32 强制全量转换
+### 修复 ④：int64/int16 → int32 强制全量转换
 
 **问题**：图简化后仍有残余 int64（如 Reshape 的 shape 常量、Cast 目标类型等）。
 
@@ -259,14 +258,6 @@ ort.InferenceSession(onnx_path, sess_options)
 - 因此 **onnxruntime 无法加载**此模型（会报 `Type 'tensor(int32)' of input parameter ... is invalid`）
 - 但 NPU 编译器有自己的类型系统，只接受 int32，所以这是正确的做法
 - 之前尝试过插入 Cast(int32→int64) 桥接节点来兼容 ONNX 规范，但 NPU 编译器同样拒绝了桥接中的 int64
-
-**转换统计**：
-
-| 指标 | 数量 |
-|------|------|
-| int64 → int32 转换 | 81 处 |
-| int16 → int32 转换 | 0 处 |
-| Cast 桥接节点 | 0（不插入） |
 
 ---
 
@@ -343,77 +334,6 @@ state_dict = torch.load(f, map_location="cpu")
 
 ---
 
-## 精度测试结果
-
-在 truck.jpg 上对 4 个不同位置的测试点，对比原始模型（nn.LayerNorm + nn.GELU）与 NPU 模型（LayerNormManual + GELUManual）：
-
-### Score 差异
-
-| 测试点 | 最大差异 | 均值差异 | Best mask 一致 |
-|--------|---------|---------|---------------|
-| truck body (500, 375) | 0.000923 | 0.000528 | Yes |
-| truck window (750, 300) | 0.000401 | 0.000133 | Yes |
-| left side (300, 500) | 0.000487 | 0.000170 | Yes |
-| ground area (900, 600) | 0.000216 | 0.000082 | Yes |
-
-### Mask IoU（二值化后 PyTorch 原始 vs NPU 版本）
-
-- 16 个 mask 中 **10 个 IoU = 1.000000**（完全一致）
-- 最低 IoU = **0.998901**（差异 < 0.12%）
-- 像素级最大差异 ≤ 0.0106
-
-**结论**：精度损失可忽略不计。
-
----
-
-## 最终 Decoder 模型参数
-
-| 指标 | 值 |
-|------|-----|
-| 节点数 | 372 |
-| 算子种类 | 28 |
-| 数据类型 | FLOAT + INT32（零 int64） |
-| 输入 shape | image_embeddings: [1,256,64,64], point_coords: [1,5,2], point_labels: [1,5] |
-| 输出 | scores: [1,4], masks: [1,4,256,256] |
-| opset version | 11 |
-
-### 完整算子清单
-
-| 算子 | 来源 | ONNX opset |
-|------|------|-----------|
-| `Add` | 残差连接、bias、LayerNorm | 1 |
-| `Cast` | 类型转换（float↔int32, bool→float 等） | 1 |
-| `Concat` | token 拼接 | 1 |
-| `ConvTranspose` | mask upscaling 转置卷积 | 1 |
-| `Cos` | 位置编码 sin/cos | 7 |
-| `Div` | LayerNorm 归一化、attention 缩放 | 1 |
-| `Equal` | prompt label 比较 (label == i) | 1 |
-| `Expand` | tensor 广播 | 8 |
-| `Gather` | embedding 索引 | 1 |
-| `Gemm` | 线性层 (weight * x + bias) | 1 |
-| `Greater` | stability score 阈值比较 | 1 |
-| `MatMul` | attention Q*K^T, attention*V | 1 |
-| `Mul` | 权重缩放、GELU 计算、LayerNorm | 1 |
-| `Not` | 逻辑非 | 1 |
-| `Pow` | LayerNorm 方差计算 (x^2) | 1 |
-| `ReduceMean` | LayerNorm 均值/方差 | 1 |
-| `ReduceSum` | stability score 求和 | 1 |
-| `Relu` | transformer MLP 激活 | 1 |
-| `Reshape` | attention head 重排 | 5 |
-| `Sin` | 位置编码 sin/cos | 7 |
-| `Slice` | tensor 切片 | 1 |
-| `Softmax` | attention 权重归一化 | 1 |
-| `Sqrt` | LayerNorm 标准差 | 1 |
-| `Sub` | LayerNorm 去均值 | 1 |
-| `Tanh` | GELU tanh 近似 | 1 |
-| `Tile` | tensor 重复 | 1 |
-| `Transpose` | attention head 重排 | 1 |
-| `Unsqueeze` | 维度扩展 | 1 |
-
-28 种算子，全部在 **opset 11 以内**。
-
----
-
 ## 完整处理流水线
 
 ```
@@ -430,7 +350,6 @@ state_dict = torch.load(f, map_location="cpu")
   ┌───────────────────────┐
   │ ① replace_gelu()      │  2 个 nn.GELU → GELUManual (tanh)
   │ ② patch_stability_score│  int16 → int32
-  │ ③ SamCoreMLModelNPU   │  OneHot → Gather 查表
   └───────┬───────────────┘
           │  权重通过 nn.Parameter 引用传递
           ▼
@@ -442,20 +361,19 @@ state_dict = torch.load(f, map_location="cpu")
           │  原始 ONNX 文件
           ▼
   ┌───────────────────────┐
-  │ ④ onnxruntime 图优化   │  常量折叠, 消除 shape 子图
+  │ ③ onnxruntime 图优化   │  常量折叠, 消除 shape 子图
   │    (ORT_ENABLE_BASIC) │
   └───────┬───────────────┘
           │  简化后
           ▼
   ┌───────────────────────┐
-  │ ⑤ int64 → int32 全量   │  7 处位置, 无 Cast 桥接
+  │ ④ int64 → int32 全量   │  7 处位置, 无 Cast 桥接
   │   转换 (含 Constant,   │
   │   Initializer 等)     │
   └───────┬───────────────┘
           │
           ▼
    NPU 兼容的 .onnx 文件
-   (372 节点, 28 种算子, 零 int64)
 ```
 
 ---
