@@ -96,44 +96,46 @@ class SamCoreMLModelNPU(SamCoreMLModel):
 
 
 # ============================================================
-# ONNX post-processing: convert int64 → int32
+# ONNX post-processing: convert int64/int16 → int32
 # ============================================================
 
-def convert_int64_to_int32(onnx_path):
-    """Convert all int64 occurrences to int32 in the ONNX model.
+def convert_non_int32_to_int32(onnx_path):
+    """Convert all int64 and int16 occurrences to int32 in the ONNX model.
 
-    NPU compilers (e.g. circle-quantizer) do not support int64.
-    The main source is Cast nodes from PyTorch's index_select (requires
-    torch.long / int64), but ONNX Gather works fine with int32.
+    NPU compilers (e.g. circle-quantizer) only support int32.
+    Sources: Cast→int64 from index_select, Cast→int16 from
+    calculate_stability_score's .sum(dtype=torch.int16).
     """
     import onnx
     from onnx import TensorProto, numpy_helper
 
     model = onnx.load(onnx_path)
     INT64 = TensorProto.INT64
+    INT16 = TensorProto.INT16
     INT32 = TensorProto.INT32
+    bad_types = (INT64, INT16)
     count = 0
 
     # Cast nodes: change target type
     for node in model.graph.node:
         if node.op_type == "Cast":
             for attr in node.attribute:
-                if attr.name == "to" and attr.i == INT64:
+                if attr.name == "to" and attr.i in bad_types:
                     attr.i = INT32
                     count += 1
 
-    # Constant nodes with int64 data
+    # Constant nodes
     for node in model.graph.node:
         if node.op_type == "Constant":
             for attr in node.attribute:
-                if attr.name == "value" and attr.t and attr.t.data_type == INT64:
+                if attr.name == "value" and attr.t and attr.t.data_type in bad_types:
                     arr = numpy_helper.to_array(attr.t).astype(np.int32)
                     attr.t.CopyFrom(numpy_helper.from_array(arr))
                     count += 1
 
     # Initializers
     for init in model.graph.initializer:
-        if init.data_type == INT64:
+        if init.data_type in bad_types:
             arr = numpy_helper.to_array(init).astype(np.int32)
             new_init = numpy_helper.from_array(arr, name=init.name)
             init.CopyFrom(new_init)
@@ -141,12 +143,12 @@ def convert_int64_to_int32(onnx_path):
 
     # Graph inputs/outputs/value_info
     for vi in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
-        if vi.type.tensor_type.elem_type == INT64:
+        if vi.type.tensor_type.elem_type in bad_types:
             vi.type.tensor_type.elem_type = INT32
             count += 1
 
     onnx.save(model, onnx_path)
-    print(f"  Converted {count} int64 → int32 occurrences")
+    print(f"  Converted {count} int64/int16 → int32 occurrences")
 
 
 # ============================================================
@@ -179,7 +181,7 @@ def export_encoder_to_onnx(sam, args):
     )
 
     print(f"Exported ONNX encoder model to {onnx_encoder_filename}")
-    convert_int64_to_int32(onnx_encoder_filename)
+    convert_non_int32_to_int32(onnx_encoder_filename)
 
 
 def export_decoder_to_onnx(sam, args):
@@ -220,7 +222,7 @@ def export_decoder_to_onnx(sam, args):
     )
 
     print(f"Exported ONNX decoder model to {onnx_decoder_filename}")
-    convert_int64_to_int32(onnx_decoder_filename)
+    convert_non_int32_to_int32(onnx_decoder_filename)
 
 
 if __name__ == "__main__":
