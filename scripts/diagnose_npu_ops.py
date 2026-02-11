@@ -3,24 +3,17 @@
 Diagnose NPU compilation failures by exporting 3 decoder sub-modules.
 
 Splits the EdgeSAM decoder into 3 structural parts and exports each as
-an independent ONNX model with all NPU fixes applied (opset 11, GELU->tanh,
-int16->int32, graph simplification, int64->int32).  Compile each with your
+an independent ONNX model WITHOUT any NPU fixes.  Compile each with your
 NPU toolchain; pass/fail pinpoints which subsystem is problematic.
 
   Part 1 — Prompt Encoding:
     point_coords + point_labels -> sparse_embedding
-    Operators: MatMul, Sin, Cos, Concat, Equal, Not, Cast, Expand,
-              Unsqueeze, Mul, Add, Sub
 
   Part 2 — Transformer:
     image_embeddings + sparse_embedding -> (hs, src)
-    Operators: Gemm, MatMul, Softmax, Reshape, Transpose, Add, Mul,
-              ReduceMean, Sub, Pow, Sqrt, Div (decomposed LayerNorm), Relu
 
   Part 3 — Mask Head:
     (hs, src) -> (scores, masks)
-    Operators: ConvTranspose, Tanh, Gemm, Relu, MatMul, Reshape,
-              ReduceMean, Pow, Sqrt, Div (LayerNorm2d), Cast, Slice
 
 Usage:
     python scripts/diagnose_npu_ops.py weights/edge_sam_3x.pth
@@ -36,95 +29,15 @@ import torch
 import torch.nn as nn
 
 from edge_sam import sam_model_registry
+from edge_sam.utils.amg import calculate_stability_score
 
 
 # ============================================================
-# NPU fixes (reused from export_onnx_model_npu.py)
+# Utilities
 # ============================================================
-
-class GELUManual(nn.Module):
-    """GELU using tanh approximation (eliminates Erf op)."""
-
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(
-            0.7978845608028654 * (x + 0.044715 * x * x * x)
-        ))
-
-
-def replace_gelu(model):
-    count = 0
-    for name, module in model.named_modules():
-        for attr_name in list(module._modules.keys()):
-            if isinstance(module._modules[attr_name], nn.GELU):
-                module._modules[attr_name] = GELUManual()
-                count += 1
-    return count
-
-
-def simplify_onnx(path):
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("    WARNING: onnxruntime not installed, skipping graph simplification")
-        return
-    tmp = path + ".tmp"
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-    opts.optimized_model_filepath = tmp
-    ort.InferenceSession(path, opts)
-    os.replace(tmp, path)
-    print("    Graph simplification (constant folding) done")
-
-
-def convert_int64_to_int32(path):
-    import onnx
-    import numpy as np
-    from onnx import TensorProto
-
-    model = onnx.load(path)
-    CONV = {TensorProto.INT64, TensorProto.INT16}
-    count = 0
-
-    def _dt(d):
-        return np.int64 if d == TensorProto.INT64 else np.int16
-
-    for node in model.graph.node:
-        if node.op_type == "Cast":
-            for a in node.attribute:
-                if a.name == "to" and a.i in CONV:
-                    a.i = TensorProto.INT32
-                    count += 1
-        if node.op_type in ("Constant", "ConstantOfShape"):
-            for a in node.attribute:
-                if a.name == "value" and a.t.data_type in CONV:
-                    raw = np.frombuffer(a.t.raw_data, dtype=_dt(a.t.data_type))
-                    a.t.raw_data = raw.astype(np.int32).tobytes()
-                    a.t.data_type = TensorProto.INT32
-                    count += 1
-    for init in model.graph.initializer:
-        if init.data_type in CONV:
-            raw = np.frombuffer(init.raw_data, dtype=_dt(init.data_type))
-            init.raw_data = raw.astype(np.int32).tobytes()
-            init.data_type = TensorProto.INT32
-            count += 1
-    for coll in (model.graph.value_info, model.graph.input, model.graph.output):
-        for vi in coll:
-            if vi.type.tensor_type.elem_type in CONV:
-                vi.type.tensor_type.elem_type = TensorProto.INT32
-                count += 1
-
-    del model.graph.value_info[:]
-    try:
-        from onnx import shape_inference
-        model = shape_inference.infer_shapes(model)
-    except Exception:
-        pass
-
-    onnx.save(model, path)
-    print(f"    int64/int16 -> int32: {count} conversions")
-
 
 def print_summary(path):
+    """Print operator types, data types, and I/O shapes of an ONNX model."""
     import onnx
     dtype_names = {
         1: "FLOAT", 2: "UINT8", 3: "INT8", 5: "INT16",
@@ -155,6 +68,7 @@ def print_summary(path):
 
 
 def _onnx_export(*args, **kwargs):
+    """torch.onnx.export wrapper for PyTorch >= 2.6 compatibility."""
     parts = torch.__version__.split('.')
     major, minor = int(parts[0]), int(parts[1])
     if major > 2 or (major == 2 and minor >= 6):
@@ -249,7 +163,7 @@ class Part2_Transformer(nn.Module):
 class Part3_MaskHead(nn.Module):
     """(hs, src) -> (scores, masks).
 
-    Wraps output upscaling (ConvTranspose + LayerNorm2d + GELUManual),
+    Wraps output upscaling (ConvTranspose + LayerNorm2d + GELU),
     hypernetwork MLPs, mask generation via matrix multiply, and
     stability score computation.
     """
@@ -288,21 +202,13 @@ class Part3_MaskHead(nn.Module):
         b, c, h, w = upscaled.shape
         masks = (hyper_in @ upscaled.view(b, c, h * w)).view(b, -1, h, w)
 
-        # IoU prediction (unused in stability-score mode, but still in graph)
+        # IoU prediction
         _iou_pred = self.iou_prediction_head(iou_token_out)
 
-        # Stability score (int32, matching NPU export pipeline)
-        intersections = (
-            (masks > (self.mask_threshold + self.stability_score_offset))
-            .sum(-1, dtype=torch.int32)
-            .sum(-1, dtype=torch.int32)
+        # Stability score
+        scores = calculate_stability_score(
+            masks, self.mask_threshold, self.stability_score_offset
         )
-        unions = (
-            (masks > (self.mask_threshold - self.stability_score_offset))
-            .sum(-1, dtype=torch.int32)
-            .sum(-1, dtype=torch.int32)
-        )
-        scores = intersections / unions
 
         return scores, masks
 
@@ -311,7 +217,8 @@ class Part3_MaskHead(nn.Module):
 # Export helper
 # ============================================================
 
-def export_part(module, dummy_inputs, input_names, output_names, path, desc):
+def export_part(module, dummy_inputs, input_names, output_names, path,
+                desc, opset):
     print(f"\n{'=' * 60}")
     print(f"  {desc}")
     print(f"{'=' * 60}")
@@ -320,13 +227,10 @@ def export_part(module, dummy_inputs, input_names, output_names, path, desc):
         module, dummy_inputs, path,
         input_names=input_names,
         output_names=output_names,
-        opset_version=11,
+        opset_version=opset,
         verbose=False,
     )
     print(f"  Exported to {path}")
-
-    simplify_onnx(path)
-    convert_int64_to_int32(path)
     print_summary(path)
 
 
@@ -348,23 +252,23 @@ def main():
     )
     parser.add_argument(
         "--num-points", type=int, default=5,
-        help="Number of prompt points (default: 5, must match decoder export)",
+        help="Number of prompt points (default: 5)",
+    )
+    parser.add_argument(
+        "--opset", type=int, default=11,
+        help="ONNX opset version (default: 11)",
     )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     N = args.num_points
 
-    # Load model
+    # Load model (no modifications applied)
     print("Loading model...")
     sam = sam_model_registry["edge_sam"](
         checkpoint=args.checkpoint, upsample_mode="bilinear"
     )
     sam.eval()
-
-    # Apply NPU fixes to the model
-    n_gelu = replace_gelu(sam)
-    print(f"Replaced {n_gelu} nn.GELU -> GELUManual (tanh approximation)")
 
     num_mask_tokens = sam.mask_decoder.num_mask_tokens  # 4
     num_output_tokens = 1 + num_mask_tokens  # iou + masks = 5
@@ -381,6 +285,7 @@ def main():
             ["sparse_embedding"],
             os.path.join(args.output_dir, "part1_prompt_encoding.onnx"),
             "Part 1: Prompt Encoding",
+            args.opset,
         )
 
     # --- Part 2: Transformer ---
@@ -394,6 +299,7 @@ def main():
             ["hs", "src"],
             os.path.join(args.output_dir, "part2_transformer.onnx"),
             "Part 2: Transformer (2x TwoWayAttentionBlock + final attn)",
+            args.opset,
         )
 
     # --- Part 3: Mask Head ---
@@ -407,11 +313,12 @@ def main():
             ["scores", "masks"],
             os.path.join(args.output_dir, "part3_mask_head.onnx"),
             "Part 3: Mask Head (upscaling + MLPs + stability score)",
+            args.opset,
         )
 
     # Summary
     print(f"\n{'=' * 60}")
-    print(f"Generated 3 models in {args.output_dir}/")
+    print(f"Generated 3 models in {args.output_dir}/  (opset {args.opset})")
     print()
     print("  part1_prompt_encoding.onnx  — Sin/Cos PE, label comparison")
     print("  part2_transformer.onnx      — Attention, LayerNorm, MLP")
