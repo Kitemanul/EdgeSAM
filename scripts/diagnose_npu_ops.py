@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 
 from edge_sam import sam_model_registry
-from edge_sam.utils.amg import calculate_stability_score
 
 
 # ============================================================
@@ -85,6 +84,10 @@ class Part1_PromptEncoding(nn.Module):
 
     Replicates SamCoreMLModel._embed_points: positional encoding (sin/cos),
     label comparison (equal/not/cast), and per-label embedding selection.
+
+    NPU-friendly: all boolean masks are explicitly cast to float32 before
+    arithmetic, and != is replaced with (1 - equal_mask) to avoid the
+    ONNX Not operator.
     """
 
     def __init__(self, sam):
@@ -101,13 +104,18 @@ class Part1_PromptEncoding(nn.Module):
         point_embedding = self.pe_layer._pe_encoding(point_coords)
         point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding)
 
-        point_embedding = point_embedding * (point_labels != -1)
+        # NPU-safe: explicit float32 cast, avoid Not operator
+        mask_neg1 = (point_labels == -1).to(torch.float32)
+        mask_not_neg1 = 1.0 - mask_neg1
+
+        point_embedding = point_embedding * mask_not_neg1
         point_embedding = point_embedding + \
-            self.not_a_point_embed.weight * (point_labels == -1)
+            self.not_a_point_embed.weight * mask_neg1
 
         for i in range(self.num_point_embeddings):
+            mask_i = (point_labels == i).to(torch.float32)
             point_embedding = point_embedding + \
-                self.point_embeddings[i].weight * (point_labels == i)
+                self.point_embeddings[i].weight * mask_i
 
         return point_embedding
 
@@ -178,6 +186,27 @@ class Part3_MaskHead(nn.Module):
         self.mask_threshold = sam.mask_threshold
         self.stability_score_offset = 1.0
 
+    @staticmethod
+    def _stability_score_npu(masks, mask_threshold, threshold_offset):
+        """NPU-friendly stability score: cast bool->float32 before ReduceSum.
+
+        The original calculate_stability_score uses bool.sum(dtype=int16)
+        which emits ReduceSum on bool type — unsupported by LUCI interpreter.
+        """
+        intersections = (
+            (masks > (mask_threshold + threshold_offset))
+            .to(torch.float32)
+            .sum(-1)
+            .sum(-1)
+        )
+        unions = (
+            (masks > (mask_threshold - threshold_offset))
+            .to(torch.float32)
+            .sum(-1)
+            .sum(-1)
+        )
+        return intersections / unions
+
     def forward(self, hs, src):
         # Extract tokens from transformer output
         iou_token_out = hs[:, 0, :]
@@ -205,8 +234,8 @@ class Part3_MaskHead(nn.Module):
         # IoU prediction
         _iou_pred = self.iou_prediction_head(iou_token_out)
 
-        # Stability score
-        scores = calculate_stability_score(
+        # Stability score (NPU-safe: explicit float32 cast before sum)
+        scores = self._stability_score_npu(
             masks, self.mask_threshold, self.stability_score_offset
         )
 
