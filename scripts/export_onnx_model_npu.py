@@ -1,14 +1,13 @@
 """
-Export EdgeSAM to ONNX for NPU (opset 11).
+Export EdgeSAM decoder to NPU-compatible ONNX (opset 11).
 
-Compared to export_onnx_model.py, this script applies five NPU-compatibility
+Compared to export_onnx_model.py, this script applies four NPU-compatibility
 fixes to the decoder:
 
   1. nn.GELU -> tanh approximation (eliminates unsupported Erf op)
   2. stability_score int16 -> int32 (NPU only supports int32)
-  3. OneHot -> Gather-based embedding lookup (NPU doesn't support OneHot)
-  4. onnxruntime graph simplification (constant folding eliminates Shape subgraphs)
-  5. Comprehensive int64/int16 -> int32 conversion
+  3. onnxruntime graph simplification (constant folding eliminates Shape subgraphs)
+  4. Comprehensive int64/int16 -> int32 conversion
 
 The encoder (RepViT) is pure CNN with only FLOAT types and basic ops,
 so it doesn't need most of these fixes but gets dtype conversion for safety.
@@ -44,16 +43,6 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument(
     "checkpoint", type=str, help="The path to the EdgeSAM model checkpoint."
-)
-
-parser.add_argument(
-    "--gelu-approximate",
-    action="store_true",
-    help=(
-        "Replace GELU operations with approximations using tanh. Useful "
-        "for some runtimes that have slow or unimplemented erf ops, used in GELU. "
-        "This is always enabled for --decoder export."
-    ),
 )
 
 parser.add_argument(
@@ -148,49 +137,7 @@ def patch_stability_score():
 
 
 # ============================================================
-# Fix 3: OneHot -> Gather-based embedding lookup
-# ============================================================
-
-class SamCoreMLModelNPU(SamCoreMLModel):
-    """Override _embed_points to avoid the OneHot op.
-
-    The original _embed_points uses ``(point_labels == i) for i in range(4)``
-    which the ONNX exporter fuses into an ``onnx.OneHot`` op.  Many NPU
-    compilers cannot handle OneHot.
-
-    This version builds a lookup table and uses ``torch.index_select``
-    (ONNX Gather op) instead.
-    """
-
-    def _embed_points(self, point_coords: torch.Tensor, point_labels: torch.Tensor) -> torch.Tensor:
-        point_coords = point_coords + 0.5
-        point_coords = point_coords / self.img_size
-        point_embedding = self.model.prompt_encoder.pe_layer._pe_encoding(point_coords)
-
-        # Lookup table: [not_a_point, label_0, label_1, label_2, label_3]
-        all_embeddings = torch.cat([
-            self.model.prompt_encoder.not_a_point_embed.weight,
-        ] + [
-            pe.weight for pe in self.model.prompt_encoder.point_embeddings
-        ], dim=0)  # [5, embed_dim]
-
-        # Shift labels: -1 -> 0, 0 -> 1, ..., 3 -> 4
-        indices = (point_labels + 1).to(torch.long)
-
-        # Gather embeddings (no OneHot)
-        flat_indices = indices.reshape(-1)
-        selected = torch.index_select(all_embeddings, 0, flat_indices)
-        selected = selected.reshape(indices.shape[0], indices.shape[1], -1)
-
-        # Zero out position encoding for not-a-point (index 0)
-        keep_mask = indices.to(point_embedding.dtype).clamp(min=0.0, max=1.0).unsqueeze(-1)
-
-        point_embedding = point_embedding * keep_mask + selected
-        return point_embedding
-
-
-# ============================================================
-# Fix 4: onnxruntime graph simplification (constant folding)
+# Fix 3: onnxruntime graph simplification (constant folding)
 # ============================================================
 
 def simplify_onnx(onnx_path):
@@ -204,7 +151,7 @@ def simplify_onnx(onnx_path):
     try:
         import onnxruntime as ort
     except ImportError:
-        print("  [Fix 4] WARNING: onnxruntime not installed, skipping graph simplification")
+        print("  [Fix 3] WARNING: onnxruntime not installed, skipping graph simplification")
         print("           Install with: pip install onnxruntime")
         return
 
@@ -214,11 +161,11 @@ def simplify_onnx(onnx_path):
     sess_options.optimized_model_filepath = tmp_path
     ort.InferenceSession(onnx_path, sess_options)
     os.replace(tmp_path, onnx_path)
-    print("  [Fix 4] Graph simplification (constant folding) complete")
+    print("  [Fix 3] Graph simplification (constant folding) complete")
 
 
 # ============================================================
-# Fix 5: Comprehensive int64/int16 -> int32 conversion
+# Fix 4: Comprehensive int64/int16 -> int32 conversion
 # ============================================================
 
 def convert_all_int64_to_int32(onnx_path):
@@ -243,7 +190,7 @@ def convert_all_int64_to_int32(onnx_path):
         import numpy as np
         from onnx import TensorProto, shape_inference
     except ImportError:
-        print("  [Fix 5] WARNING: onnx package not installed, skipping dtype conversion")
+        print("  [Fix 4] WARNING: onnx package not installed, skipping dtype conversion")
         print("           Install with: pip install onnx")
         return
 
@@ -322,7 +269,7 @@ def convert_all_int64_to_int32(onnx_path):
         pass  # Shape inference may fail on non-spec-compliant int32 model
 
     onnx.save(model, onnx_path)
-    print(f"  [Fix 5] Converted {count} int64/int16 -> int32 occurrences")
+    print(f"  [Fix 4] Converted {count} int64/int16 -> int32 occurrences")
 
 
 # ============================================================
@@ -389,8 +336,6 @@ def print_onnx_summary(onnx_path):
         issues.append("INT16 present (most NPUs only support INT32)")
     if "Erf" in op_counts:
         issues.append("Erf operator present (from nn.GELU, not supported by most NPUs)")
-    if "OneHot" in op_counts:
-        issues.append("OneHot operator present (not supported by most NPUs)")
     if "LayerNormalization" in op_counts:
         issues.append("LayerNormalization present (not supported by some NPUs)")
 
@@ -425,11 +370,6 @@ def _onnx_export(*args, **kwargs):
 # ============================================================
 
 def export_encoder_to_onnx(sam, args):
-    if args.gelu_approximate:
-        for n, m in sam.named_modules():
-            if isinstance(m, torch.nn.GELU):
-                m.approximate = "tanh"
-
     image_input = torch.randn(1, 3, 1024, 1024, dtype=torch.float)
     sam.forward = sam.forward_dummy_encoder
 
@@ -470,13 +410,11 @@ def export_decoder_to_onnx(sam, args):
     if args.use_stability_score:
         patch_stability_score()
 
-    # Fix 3: Use NPU-compatible decoder wrapper (Gather instead of OneHot)
-    sam_decoder = SamCoreMLModelNPU(
+    sam_decoder = SamCoreMLModel(
         model=sam,
         use_stability_score=args.use_stability_score
     )
     sam_decoder.eval()
-    print("  [Fix 3] Using SamCoreMLModelNPU (OneHot -> Gather)")
 
     embed_dim = sam.prompt_encoder.embed_dim
     embed_size = sam.prompt_encoder.image_embedding_size
@@ -504,10 +442,10 @@ def export_decoder_to_onnx(sam, args):
 
     print(f"Exported decoder to {onnx_path}")
 
-    # Fix 4: Graph simplification (constant folding to eliminate Shape subgraphs)
+    # Fix 3: Graph simplification (constant folding to eliminate Shape subgraphs)
     simplify_onnx(onnx_path)
 
-    # Fix 5: Comprehensive int64/int16 -> int32 conversion
+    # Fix 4: Comprehensive int64/int16 -> int32 conversion
     convert_all_int64_to_int32(onnx_path)
 
     if args.check_ops_only:
