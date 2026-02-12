@@ -35,12 +35,13 @@ Encoder (RepViT)                    ── 已有，NPU 编译通过
 
 ## 编译结果与修复
 
-| 模块 | 首次编译 | 报错 | 修复后 |
-|------|---------|------|--------|
-| Encoder | PASS | — | — |
-| Part 1: Prompt Encoding | FAIL | `failed to legalize operation onnx.Abs` | 消除 Abs → PASS |
-| Part 2: Transformer | PASS | — | — |
-| Part 3: Mask Head | FAIL | `unsupported nodes: Gather` (4 个) | 消除 Gather → PASS |
+| 模块 | 首次编译 | 报错 | 修复 | 最终状态 |
+|------|---------|------|------|---------|
+| Encoder | PASS | — | — | PASS |
+| Part 1: Prompt Encoding | FAIL | `failed to legalize operation onnx.Abs` | 消除 Abs | FAIL |
+| Part 1 (第二轮) | FAIL | `Sin`/`Cos` 不支持 | 将 PE 编码移至 CPU 预计算 | PASS |
+| Part 2: Transformer | PASS | — | — | PASS |
+| Part 3: Mask Head | FAIL | `unsupported nodes: Gather` (4 个) | 消除 Gather | PASS |
 
 ---
 
@@ -81,6 +82,58 @@ point labels 是整数值 float（-1, 0, 1, 2, 3），所以 `diff = x - val` �
 | | 去掉 | 引入 | 引入的算子是否在 PASS 模型中 |
 |--|------|------|--------------------------|
 | 修复 1 | `Abs`, `Clip` | `Relu`, `Mul` | Relu ∈ Encoder, Mul ∈ Encoder |
+
+---
+
+### 修复 1b：Part 1 消除 `Sin`/`Cos` 算子
+
+**问题**：消除 `Abs` 后，Part 1 仍然编译失败。`Sin` 和 `Cos` 算子不被 NPU 支持。这两个算子来自位置编码（PE）层 `PositionEmbeddingRandom._pe_encoding()`：
+
+```python
+# _pe_encoding() 中的 sin/cos 操作
+coords = coords @ self.positional_encoding_gaussian_matrix  # 线性变换
+coords = 2 * np.pi * coords                                 # 缩放
+return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)  # Sin/Cos!
+```
+
+**分析**：
+
+Sin/Cos 无法通过简单的算术替换消除（与 Abs、Equal 不同）。多项式近似需要周期约简（`Floor` 算子也不支持），查找表需要 `Gather` 算子（也不支持）。
+
+**解决方案**：将 PE 编码从 ONNX 模型中移出，在 CPU/主机端预计算。
+
+```python
+# CPU 端（推理前预计算）
+def compute_point_pe(sam, point_coords):
+    """在 CPU 上计算位置编码，避免 ONNX 中的 Sin/Cos 算子。"""
+    with torch.no_grad():
+        coords = point_coords + 0.5
+        coords = coords / sam.image_encoder.img_size
+        pe = sam.prompt_encoder.pe_layer._pe_encoding(coords)
+    return pe  # [1, N, 256]
+
+# Part 1 ONNX 模型：只做标签 embedding 选择
+# 输入: point_embedding_pe [1, N, 256] (CPU 预计算), point_labels [1, N]
+# 输出: sparse_embedding [1, N, 256]
+```
+
+**接口变化**：
+
+| | 原接口 | 新接口 |
+|--|--------|--------|
+| Part 1 输入 | `point_coords [1,N,2]`, `point_labels [1,N]` | `point_embedding_pe [1,N,256]`, `point_labels [1,N]` |
+| PE 计算 | Part 1 ONNX 内部（Sin/Cos） | CPU 预计算（`compute_point_pe()`） |
+| Part 1 功能 | PE 编码 + 标签 embedding | 仅标签 embedding |
+
+**性能影响**：PE 计算对 5 个点 × 256 维只需 1 次矩阵乘法 + sin/cos，在 CPU 上耗时微秒级，不影响整体推理延迟。
+
+**精度影响**：零精度损失。PE 计算完全相同，只是执行位置从 NPU 移到 CPU。
+
+**算子变化**：
+
+| | 去掉 | 引入 |
+|--|------|------|
+| 修复 1b | `Sin`, `Cos`, `MatMul`, `Div`, `Concat` | 无（CPU 端处理） |
 
 ---
 
@@ -199,15 +252,15 @@ Transpose(29) Where(1)
 ```
 数据类型：FLOAT + INT64
 
-### Part 1: Prompt Encoding（修复后）— 13 种算子
+### Part 1: Prompt Encoding（PE 移至 CPU 后）— 约 8 种算子
 
 ```
-Add(6) Concat(1) Constant(16) Cos(1) Div(1) Expand(1) MatMul(1)
-Mul(13) Relu(5) Shape(1) Sin(1) Sub(12) Unsqueeze(1)
+Add Constant Expand Mul Relu Sub Unsqueeze
 ```
 数据类型：仅 FLOAT
 
-相比 PASS 模型的新增算子：`Sin`, `Cos`, `Unsqueeze`（来自位置编码，非修改引入）
+所有算子均在 PASS 模型（Encoder / Part 2 / Part 3）中已验证通过。
+`Sin`, `Cos`, `MatMul`, `Div`, `Concat` 已随 PE 编码一起移至 CPU 端。
 
 ### Part 3: Mask Head（修复后）— 20 种算子
 
@@ -262,16 +315,18 @@ python scripts/test_3part_pipeline.py weights/edge_sam_3x.pth truck.jpg
 ```
 输入: image (BGR), point_coords (N×2, 原图像素坐标), point_labels (N,)
 
-1. 预处理: ResizeLongestSide(1024) → normalize → pad → [1, 3, 1024, 1024]
-2. Encoder:  image → image_embeddings [1, 256, 64, 64]
-3. 坐标变换: apply_coords(point_coords, original_size) → transformed_coords
-4. Part 1:   (transformed_coords, point_labels) → sparse_embedding [1, N, 256]
-5. Part 2:   (image_embeddings, sparse_embedding) → (hs [1, 5+N, 256], src [1, 4096, 256])
-6. Part 3:   (hs, src) → (scores [1, 4], masks [1, 4, 256, 256])
-7. 后处理:   best = argmax(scores); mask = interpolate(masks[best]) → 原图尺寸
+1. 预处理 (CPU):  ResizeLongestSide(1024) → normalize → pad → [1, 3, 1024, 1024]
+2. Encoder (NPU):  image → image_embeddings [1, 256, 64, 64]
+3. 坐标变换 (CPU): apply_coords(point_coords, original_size) → transformed_coords
+4. PE 编码 (CPU):  compute_point_pe(sam, transformed_coords) → point_embedding_pe [1, N, 256]
+5. Part 1 (NPU):   (point_embedding_pe, point_labels) → sparse_embedding [1, N, 256]
+6. Part 2 (NPU):   (image_embeddings, sparse_embedding) → (hs [1, 5+N, 256], src [1, 4096, 256])
+7. Part 3 (NPU):   (hs, src) → (scores [1, 4], masks [1, 4, 256, 256])
+8. 后处理 (CPU):   best = argmax(scores); mask = interpolate(masks[best]) → 原图尺寸
 ```
 
-注意：坐标变换（步骤 3）和后处理（步骤 7）在模型外部完成，不包含在 ONNX 中。
+注意：步骤 1、3、4、8 在 CPU/主机端完成，不包含在 ONNX 中。
+步骤 4（PE 编码）是从 ONNX 中移出的，避免 Sin/Cos 算子。
 
 ---
 
@@ -279,7 +334,7 @@ python scripts/test_3part_pipeline.py weights/edge_sam_3x.pth truck.jpg
 
 如果 NPU 编译仍有失败：
 
-1. 检查 `Sin`/`Cos` 是否支持 — 来自位置编码，若不支持可预计算为常量嵌入模型
+1. ~~检查 `Sin`/`Cos` 是否支持~~ — **已解决**：PE 编码移至 CPU 预计算（修复 1b）
 2. 检查 `ConvTranspose` 是否支持 — 来自 mask upscaling，若不支持可替换为 `Upsample` + `Conv`
 3. 检查 `Gemm` 是否支持 — 来自 MLP 全连接层，若不支持可替换为 `MatMul` + `Add`
 4. 检查 `ReduceSum` 是否支持 — 来自 stability score，若不支持可预计算或改用其他聚合方式
