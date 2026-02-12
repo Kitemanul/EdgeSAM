@@ -3,8 +3,11 @@
 Test that the 3-part ONNX decoder pipeline produces identical results
 to the original PyTorch model (SamCoreMLModel path) for point-based segmentation.
 
-Pipeline:  encoder (PyTorch) -> Part1 -> Part2 -> Part3 (ONNX)
+Pipeline:  encoder (PyTorch) -> PE (CPU) -> Part1 -> Part2 -> Part3 (ONNX)
 Reference: encoder (PyTorch) -> SamCoreMLModel (PyTorch)
+
+The PE (positional encoding) step is done on CPU to avoid Sin/Cos ONNX ops
+that NPU compilers do not support.
 
 The 3-part split replicates SamCoreMLModel's behavior (no padding point),
 NOT SamPredictor's behavior (which auto-adds a padding point).
@@ -76,18 +79,40 @@ def run_reference(sam, image_embeddings, point_coords, point_labels):
     return scores.numpy(), masks.numpy()
 
 
-def run_3part_pipeline(onnx_dir, image_embeddings_np, point_coords, point_labels):
+def compute_point_pe_np(sam, point_coords):
+    """Compute positional encoding on CPU for the 3-part pipeline.
+
+    Replicates the sin/cos PE computation that was moved out of the
+    ONNX model to avoid unsupported Sin/Cos NPU ops.
+
+    Args:
+        sam: EdgeSAM model
+        point_coords: numpy array [1, N, 2] of point coordinates (model space)
+
+    Returns:
+        numpy array [1, N, 256] of positional encodings
+    """
+    coords_tensor = torch.from_numpy(point_coords).float()
+    with torch.no_grad():
+        coords = coords_tensor + 0.5
+        coords = coords / sam.image_encoder.img_size
+        pe = sam.prompt_encoder.pe_layer._pe_encoding(coords)
+    return pe.numpy()
+
+
+def run_3part_pipeline(sam, onnx_dir, image_embeddings_np, point_coords, point_labels):
     """Run Part1 -> Part2 -> Part3 ONNX pipeline."""
     part1 = ort.InferenceSession(os.path.join(onnx_dir, "part1_prompt_encoding.onnx"))
     part2 = ort.InferenceSession(os.path.join(onnx_dir, "part2_transformer.onnx"))
     part3 = ort.InferenceSession(os.path.join(onnx_dir, "part3_mask_head.onnx"))
 
-    coords_input = point_coords.astype(np.float32)
+    # Pre-compute PE on CPU (avoids Sin/Cos ONNX ops unsupported by NPU)
+    pe_input = compute_point_pe_np(sam, point_coords)
     labels_input = point_labels.astype(np.float32)
 
-    # Part 1: Prompt Encoding
+    # Part 1: Label Embedding (PE pre-computed on CPU)
     sparse_embedding = part1.run(None, {
-        "point_coords": coords_input,
+        "point_embedding_pe": pe_input,
         "point_labels": labels_input,
     })[0]
 
@@ -178,9 +203,9 @@ def main():
         # Reference (SamCoreMLModel, PyTorch)
         ref_scores, ref_masks = run_reference(sam, image_embeddings, coords_batch, labels_batch)
 
-        # Pipeline (3-part ONNX)
+        # Pipeline (3-part ONNX, with PE pre-computed on CPU)
         pipe_scores, pipe_masks = run_3part_pipeline(
-            args.onnx_dir, image_embeddings_np, coords_batch, labels_batch
+            sam, args.onnx_dir, image_embeddings_np, coords_batch, labels_batch
         )
 
         # Compare scores

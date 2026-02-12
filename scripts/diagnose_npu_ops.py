@@ -76,27 +76,47 @@ def _onnx_export(*args, **kwargs):
 
 
 # ============================================================
-# Part 1: Prompt Encoding
+# Part 1: Prompt Encoding (Label Embedding Only)
 # ============================================================
 
+def compute_point_pe(sam, point_coords):
+    """Compute positional encoding for point coordinates on CPU.
+
+    This is done outside the ONNX model to avoid Sin/Cos ONNX ops
+    which are not supported by NPU compilers.
+
+    Args:
+        sam: EdgeSAM model
+        point_coords: [1, N, 2] float tensor of point coordinates
+                      (in model pixel space, after apply_coords)
+
+    Returns:
+        point_embedding_pe: [1, N, 256] float tensor of positional encodings
+    """
+    with torch.no_grad():
+        coords = point_coords + 0.5
+        coords = coords / sam.image_encoder.img_size
+        pe = sam.prompt_encoder.pe_layer._pe_encoding(coords)
+    return pe
+
+
 class Part1_PromptEncoding(nn.Module):
-    """point_coords + point_labels -> sparse_embedding.
+    """point_embedding_pe + point_labels -> sparse_embedding.
 
-    Replicates SamCoreMLModel._embed_points: positional encoding (sin/cos),
-    label comparison, and per-label embedding selection.
+    The positional encoding (sin/cos) is pre-computed on the CPU via
+    compute_point_pe() to avoid Sin/Cos ONNX ops that NPU compilers
+    do not support.  This module only handles label-based embedding
+    selection using pure float arithmetic.
 
-    NPU-friendly: all label masks are computed via pure float arithmetic
-    (Sub, Abs, Clamp) instead of Equal/Cast(bool), avoiding any boolean
-    tensor ops that NPU compilers may not support.
+    NPU-friendly: all label masks are computed via pure float ops
+    (Sub, Mul, Relu) instead of Equal/Cast(bool).
     """
 
     def __init__(self, sam):
         super().__init__()
-        self.pe_layer = sam.prompt_encoder.pe_layer
         self.point_embeddings = sam.prompt_encoder.point_embeddings
         self.not_a_point_embed = sam.prompt_encoder.not_a_point_embed
         self.num_point_embeddings = sam.prompt_encoder.num_point_embeddings
-        self.img_size = sam.image_encoder.img_size
 
     @staticmethod
     def _float_eq(x, val):
@@ -108,17 +128,14 @@ class Part1_PromptEncoding(nn.Module):
         diff = x - val
         return torch.relu(1.0 - diff * diff)
 
-    def forward(self, point_coords, point_labels):
-        point_coords = point_coords + 0.5
-        point_coords = point_coords / self.img_size
-        point_embedding = self.pe_layer._pe_encoding(point_coords)
-        point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding)
+    def forward(self, point_embedding_pe, point_labels):
+        point_labels = point_labels.unsqueeze(-1).expand_as(point_embedding_pe)
 
         # NPU-safe: pure float arithmetic masks (no Equal, Not, Cast)
         mask_neg1 = self._float_eq(point_labels, -1.0)
         mask_not_neg1 = 1.0 - mask_neg1
 
-        point_embedding = point_embedding * mask_not_neg1
+        point_embedding = point_embedding_pe * mask_not_neg1
         point_embedding = point_embedding + \
             self.not_a_point_embed.weight * mask_neg1
 
@@ -340,17 +357,18 @@ def main():
     num_output_tokens = 1 + num_mask_tokens  # iou + masks = 5
     total_tokens = num_output_tokens + N  # 5 + N = 10
 
-    # --- Part 1: Prompt Encoding ---
+    # --- Part 1: Prompt Encoding (label embedding only, PE pre-computed on CPU) ---
     part1 = Part1_PromptEncoding(sam).eval()
+    embed_dim = sam.prompt_encoder.embed_dim  # 256
     with torch.no_grad():
         export_part(
             part1,
-            (torch.randint(0, 1024, (1, N, 2), dtype=torch.float),
+            (torch.randn(1, N, embed_dim),
              torch.randint(0, 4, (1, N), dtype=torch.float)),
-            ["point_coords", "point_labels"],
+            ["point_embedding_pe", "point_labels"],
             ["sparse_embedding"],
             os.path.join(args.output_dir, "part1_prompt_encoding.onnx"),
-            "Part 1: Prompt Encoding",
+            "Part 1: Prompt Encoding (label embedding, PE pre-computed on CPU)",
             args.opset,
         )
 
@@ -386,9 +404,12 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"Generated 3 models in {args.output_dir}/  (opset {args.opset})")
     print()
-    print("  part1_prompt_encoding.onnx  — Sin/Cos PE, label comparison")
+    print("  part1_prompt_encoding.onnx  — Label embedding (PE pre-computed on CPU)")
     print("  part2_transformer.onnx      — Attention, LayerNorm, MLP")
     print("  part3_mask_head.onnx        — ConvTranspose, upscaling, scores")
+    print()
+    print("NOTE: Part 1 requires PE pre-computation on CPU before inference.")
+    print("      Use compute_point_pe(sam, point_coords) to get point_embedding_pe.")
     print()
     print("Compile each with your NPU toolchain and report PASS/FAIL.")
     print(f"{'=' * 60}")
