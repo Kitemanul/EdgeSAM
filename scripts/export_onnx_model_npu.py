@@ -8,12 +8,10 @@ The decoder applies 5 NPU compatibility fixes to eliminate unsupported ops:
   Fix 4: Erf     → GELU replaced with tanh approximation
   Fix 5: bool ReduceSum → sigmoid step for stability score
 
-Plus 1 post-processing step on the exported ONNX file:
-  Fix 6: ONNX graph simplification (constant folding)
-
-Note: int64→int32 conversion is NOT applied. The NPU compiler requires
-int64 for Reshape shape inputs (per ONNX spec). The 3-part split testing
-confirmed that int64 data types compile correctly.
+No ONNX post-processing is applied (no graph simplification, no int64→int32
+conversion). The 3-part split testing confirmed that raw PyTorch ONNX export
+output compiles correctly on NPU. Post-processing steps were found to cause
+compilation errors (int32 Reshape shapes, corrupted tensor buffers).
 
 IMPORTANT: The decoder accepts pre-computed positional encoding
 (point_embedding_pe) instead of raw point coordinates. The PE must
@@ -460,8 +458,6 @@ def export_decoder(sam, args):
         )
     print(f"Exported decoder to {onnx_path}")
 
-    # Post-processing
-    _simplify_onnx(onnx_path)
     _print_onnx_summary(onnx_path)
 
     if args.check_ops_only:
