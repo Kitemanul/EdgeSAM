@@ -8,9 +8,12 @@ The decoder applies 5 NPU compatibility fixes to eliminate unsupported ops:
   Fix 4: Erf     → GELU replaced with tanh approximation
   Fix 5: bool ReduceSum → sigmoid step for stability score
 
-Plus 2 post-processing steps on the exported ONNX file:
+Plus 1 post-processing step on the exported ONNX file:
   Fix 6: ONNX graph simplification (constant folding)
-  Fix 7: int64/int16 → int32 conversion
+
+Note: int64→int32 conversion is NOT applied. The NPU compiler requires
+int64 for Reshape shape inputs (per ONNX spec). The 3-part split testing
+confirmed that int64 data types compile correctly.
 
 IMPORTANT: The decoder accepts pre-computed positional encoding
 (point_embedding_pe) instead of raw point coordinates. The PE must
@@ -421,7 +424,6 @@ def export_encoder(sam, args):
     )
     print(f"Exported encoder to {onnx_path}")
 
-    _convert_int64_to_int32(onnx_path)
     _print_onnx_summary(onnx_path)
 
     if args.check_ops_only:
@@ -460,7 +462,6 @@ def export_decoder(sam, args):
 
     # Post-processing
     _simplify_onnx(onnx_path)
-    _convert_int64_to_int32(onnx_path)
     _print_onnx_summary(onnx_path)
 
     if args.check_ops_only:
