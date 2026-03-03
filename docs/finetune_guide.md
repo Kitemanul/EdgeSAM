@@ -4,13 +4,142 @@ This guide walks you through fine-tuning EdgeSAM's mask decoder with point promp
 
 ## Table of Contents
 
-1. [Why Fine-tune?](#why-fine-tune)
-2. [Prerequisites](#prerequisites)
-3. [Data Preparation](#data-preparation)
-4. [Training](#training)
-5. [Parameter Tuning Guide](#parameter-tuning-guide)
-6. [Inference](#inference)
-7. [Troubleshooting](#troubleshooting)
+1. [Training Strategy](#training-strategy)
+2. [Why Fine-tune?](#why-fine-tune)
+3. [Prerequisites](#prerequisites)
+4. [Data Preparation](#data-preparation)
+5. [Training](#training)
+6. [Parameter Tuning Guide](#parameter-tuning-guide)
+7. [Inference](#inference)
+8. [Troubleshooting](#troubleshooting)
+
+---
+
+## Training Strategy
+
+### The Core Problem
+
+SAM / EdgeSAM is trained on SA-1B, which has **multi-granularity** annotations: the same person might have separate masks for the whole body, upper body, shirt, pants, shoes, skin, and even logos. A single point prompt is inherently ambiguous — the model must guess which granularity you want.
+
+When you click on an athlete, the original model often returns the most "visually coherent" local region (a piece of clothing, a patch of skin) rather than the whole person. This is by design in SAM, not a bug.
+
+### Strategy Overview
+
+Fine-tuning solves this by **redefining what a point means in your domain**: a point on a person always means the whole person.
+
+```
+Before fine-tuning:  point on shirt → shirt mask (part-level)
+After fine-tuning:   point on shirt → whole athlete mask (object-level)
+```
+
+### Strategy 1: Single-Point Supervised Fine-tuning (Recommended Start)
+
+The simplest and most effective approach. Each training sample is:
+- **Input**: one image + one random point sampled from inside the GT mask
+- **Target**: the whole-object GT mask
+- **Loss**: BCE + Dice on predicted mask vs GT mask
+
+```bash
+python training/finetune.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --num-points 1 --epochs 10 --lr 1e-4
+```
+
+**Why it works**: Across many training iterations, the random point lands on different body parts (head, torso, legs, shoes). Every time, the target is the **same** whole-body mask. The decoder learns that regardless of where the point is, the output should be the full person.
+
+**Limitation**: Each iteration only gives one "perspective" of the object. May need more epochs to converge.
+
+### Strategy 2: Multi-Point Training (Stronger Whole-Object Signal)
+
+Sample 2-3 positive points from different locations within the same GT mask. This gives the decoder a stronger geometric signal: "these scattered points all belong to one object."
+
+```bash
+python training/finetune.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --num-points 3 --epochs 10 --lr 1e-4
+```
+
+**When to use**: If Strategy 1 still produces part-level masks after sufficient training. Multi-point is especially helpful for:
+- Tall/elongated objects (full-body athletes in action poses)
+- Objects with visually distinct parts (multi-colored uniforms)
+- Complex poses where body parts are separated (spread arms/legs)
+
+**Trade-off**: The model learns with multi-point input, but at inference you might only provide 1 point. Training with `--num-points 3` and inferring with 1 point still works — the decoder generalizes — but the best results come when train and inference point counts are similar.
+
+### Strategy 3: Progressive Training (Two-Stage)
+
+If your dataset is large enough, train in two stages:
+
+**Stage 1**: Coarse alignment with multi-point (fast convergence)
+```bash
+python training/finetune.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --num-points 3 --epochs 5 --lr 3e-4 \
+    --output output/stage1
+```
+
+**Stage 2**: Refine with single-point (match inference scenario)
+```bash
+python training/finetune.py \
+    --checkpoint output/stage1/finetune_best.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --num-points 1 --epochs 10 --lr 5e-5 \
+    --output output/stage2
+```
+
+This gives the decoder a strong whole-object prior first, then adapts it to single-point input.
+
+### Strategy 4: Hard Example Mining with Focal Loss
+
+If the model handles easy cases (torso clicks) well but fails on hard cases (edge clicks on hands, feet, head), add focal loss to focus on boundary regions:
+
+```bash
+python training/finetune.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --num-points 1 --epochs 15 --lr 1e-4 \
+    --bce-weight 2.0 --dice-weight 5.0 --focal-weight 5.0
+```
+
+Focal loss down-weights easy pixels (clear foreground/background) and up-weights hard pixels (boundaries, ambiguous regions).
+
+### Choosing a Strategy
+
+```
+Start here
+    │
+    ▼
+Strategy 1 (single-point, default settings)
+    │
+    ├── mIoU > 0.85? ──▶ Done! Use this model.
+    │
+    ▼
+Still segmenting parts?
+    │
+    ├── Yes ──▶ Strategy 2 (multi-point, --num-points 3)
+    │               │
+    │               ├── Better? ──▶ Strategy 3 (progressive, 2-stage)
+    │               │
+    │               └── Still bad? ──▶ Check annotation quality.
+    │                                   Masks must be whole-body.
+    │
+    └── Boundaries are poor ──▶ Strategy 4 (focal loss)
+```
+
+### Key Principles
+
+1. **Data quality > training tricks**: Whole-body GT masks are the single most important factor. If your masks only cover torsos, no training strategy will produce full-body segmentation.
+
+2. **Freeze the encoder**: The RepViT encoder already extracts excellent features. Fine-tuning it risks catastrophic forgetting and requires much more data/compute. Only consider unfreezing the encoder if you have 10,000+ domain-specific images and the encoder features are clearly inadequate.
+
+3. **Use `multimask_output=False` at inference**: The fine-tuned decoder is trained with single mask output (`num_multimask_outputs=1`). Always use `multimask_output=False` in `SamPredictor.predict()` for best results.
+
+4. **Evaluation point sampling matters**: During validation, mIoU is computed with random points. If you care about specific click locations (e.g., always clicking on the torso), evaluate with those specific locations too.
+
+5. **Domain narrowing helps**: "Segment athletes in sports photos" is easier to learn than "segment any person in any context." If possible, make your training data match your deployment scenario.
 
 ---
 
