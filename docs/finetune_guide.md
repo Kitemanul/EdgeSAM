@@ -10,8 +10,9 @@ This guide walks you through fine-tuning EdgeSAM's mask decoder with point promp
 4. [Data Preparation](#data-preparation)
 5. [Training](#training)
 6. [Parameter Tuning Guide](#parameter-tuning-guide)
-7. [Inference](#inference)
-8. [Troubleshooting](#troubleshooting)
+7. [Evaluation](#evaluation)
+8. [Inference](#inference)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -449,6 +450,136 @@ python training/finetune.py \
     --val-ann-file val.json --val-img-dir images/val/ \
     --epochs 5 --lr 3e-4 --batch-size 8 --num-points 3
 ```
+
+---
+
+## Evaluation
+
+Use `scripts/eval_iou.py` to measure mIoU on your validation set. This is essential for comparing models before/after fine-tuning.
+
+### Basic Evaluation
+
+```bash
+python scripts/eval_iou.py \
+    --checkpoint output/finetune/finetune_best.pth \
+    --ann-file /path/to/annotations/val.json \
+    --img-dir /path/to/images/val/
+```
+
+### Compare Before vs After Fine-tuning
+
+```bash
+# Before (original EdgeSAM)
+python scripts/eval_iou.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file val.json --img-dir images/val/ \
+    --output results/baseline.json
+
+# After (fine-tuned)
+python scripts/eval_iou.py \
+    --checkpoint output/finetune/finetune_best.pth \
+    --ann-file val.json --img-dir images/val/ \
+    --output results/finetuned.json
+```
+
+### Point Sampling Strategies
+
+The evaluation supports three point strategies:
+
+| Strategy | Flag | Description |
+|----------|------|-------------|
+| **random** | `--point-strategy random` | Random point from inside GT mask (default). Reflects real-world usage where the user clicks anywhere on the object |
+| **center** | `--point-strategy center` | Centroid of the GT mask. Best-case scenario: clicking dead center |
+| **bbox_center** | `--point-strategy bbox_center` | Center of the bounding box. Approximates a "rough click" |
+
+Evaluate with all three to understand model robustness:
+
+```bash
+for strategy in random center bbox_center; do
+    echo "=== $strategy ==="
+    python scripts/eval_iou.py \
+        --checkpoint output/finetune/finetune_best.pth \
+        --ann-file val.json --img-dir images/val/ \
+        --point-strategy $strategy
+done
+```
+
+### Multi-Point Evaluation
+
+If you trained with `--num-points 3`, evaluate with the same setting:
+
+```bash
+python scripts/eval_iou.py \
+    --checkpoint output/finetune/finetune_best.pth \
+    --ann-file val.json --img-dir images/val/ \
+    --num-points 3
+```
+
+Also test with 1 point to verify single-point generalization:
+
+```bash
+python scripts/eval_iou.py \
+    --checkpoint output/finetune/finetune_best.pth \
+    --ann-file val.json --img-dir images/val/ \
+    --num-points 1
+```
+
+### Output
+
+The script prints:
+
+```
+==================================================
+  Checkpoint : output/finetune/finetune_best.pth
+  Dataset    : val.json
+  Strategy   : random, 1 point(s)
+  Images     : 500
+  Masks      : 1823
+==================================================
+  mIoU       : 0.8634
+  Median IoU : 0.8921
+  Std        : 0.1245
+  Min IoU    : 0.1023
+  Max IoU    : 0.9876
+
+  IoU distribution:
+    >= 0.50 :  95.2%  ###############################################
+    >= 0.75 :  82.1%  #########################################
+    >= 0.90 :  45.3%  ######################
+    >= 0.95 :  12.7%  ######
+
+  Worst 10 images:
+    hard_case_001.jpg                         mIoU=0.3214  (3 masks)
+    ...
+```
+
+Use `--output results.json` to save full per-image results for further analysis.
+
+### Evaluation Parameters
+
+```
+--checkpoint          Model weights to evaluate [required]
+--ann-file            COCO annotation JSON [required]
+--img-dir             Image directory [required]
+--num-points          Points per mask [default: 1]
+--point-strategy      random / center / bbox_center [default: random]
+--max-masks-per-image Limit masks per image (-1 = all) [default: -1]
+--max-images          Limit total images (-1 = all) [default: -1]
+--seed                Random seed for reproducibility [default: 42]
+--output              Save results JSON to this path [optional]
+```
+
+### Interpreting Results
+
+| mIoU Range | Interpretation |
+|-----------|---------------|
+| < 0.60 | Poor. Check data, annotations, or training config |
+| 0.60 - 0.75 | Moderate. May need more training or better data |
+| 0.75 - 0.85 | Good. Usable for most applications |
+| 0.85 - 0.92 | Very good. Fine boundary details may still be off |
+| > 0.92 | Excellent |
+
+**Tip**: Look at the "Worst 10 images" to identify failure patterns (occlusion, unusual poses, small objects, etc.).
 
 ---
 
