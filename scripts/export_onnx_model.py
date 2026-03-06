@@ -46,8 +46,6 @@ def export_encoder_to_onnx(sam, args):
     image_input = torch.randn(1, 3, 1024, 1024, dtype=torch.float)
     sam.forward = sam.forward_dummy_encoder
 
-    traced_model = torch.jit.trace(sam, image_input)
-
     # Define the input names and output names
     input_names = ["image"]
     output_names = ["image_embeddings"]
@@ -55,12 +53,12 @@ def export_encoder_to_onnx(sam, args):
     # Export the encoder model to ONNX format
     onnx_encoder_filename = args.checkpoint.replace('.pth', '_encoder.onnx')
     torch.onnx.export(
-        traced_model,
+        sam,
         image_input,
         onnx_encoder_filename,
         input_names=input_names,
         output_names=output_names,
-        opset_version=11,  # Use an appropriate ONNX opset version
+        dynamo=False,
         verbose=False
     )
 
@@ -98,7 +96,7 @@ def export_decoder_to_onnx(sam, args):
         onnx_decoder_filename,
         input_names=input_names,
         output_names=output_names,
-        opset_version=11,  # Use an appropriate ONNX opset version
+        dynamo=False,
         dynamic_axes={
             "point_coords": {1: "num_points"},
             "point_labels": {1: "num_points"},
