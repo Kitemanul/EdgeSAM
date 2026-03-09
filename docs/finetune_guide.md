@@ -301,11 +301,49 @@ Note: `--batch-size` is **per GPU**. With 4 GPUs and `--batch-size 4`, effective
 output/finetune/
 ├── finetune_epoch_0.pth    # Checkpoint after epoch 0
 ├── finetune_epoch_1.pth    # Checkpoint after epoch 1
+├── finetune_step_500.pth   # Step checkpoint (if --save-step-freq is set)
 ├── ...
-└── finetune_best.pth       # Best checkpoint (highest val mIoU)
+├── finetune_best.pth       # Best checkpoint (highest val mIoU)
+└── tensorboard/            # TensorBoard event files
 ```
 
 All checkpoints are full model state_dicts, directly loadable by `sam_model_registry['edge_sam']()`.
+
+### Monitoring with TensorBoard
+
+Training metrics are logged automatically to `{output}/tensorboard/`. Launch TensorBoard in a separate terminal:
+
+```bash
+tensorboard --logdir output/finetune/tensorboard
+# Then open http://localhost:6006 in your browser
+```
+
+Logged metrics:
+
+| Metric | X-axis | Description |
+|--------|--------|-------------|
+| `train/loss_step` | global step | Per-step loss |
+| `train/mIoU_step` | global step | Per-step mIoU |
+| `train/lr` | global step | Learning rate schedule |
+| `train/loss_epoch` | epoch | Epoch-averaged training loss |
+| `train/mIoU_epoch` | epoch | Epoch-averaged training mIoU |
+| `val/loss_epoch` | epoch | Epoch-averaged validation loss (if val set provided) |
+| `val/mIoU_epoch` | epoch | Epoch-averaged validation mIoU (if val set provided) |
+
+### Saving Checkpoints by Step
+
+Use `--save-step-freq` to save checkpoints at fixed step intervals, useful for long training runs or early stopping:
+
+```bash
+python training/finetune.py \
+    --checkpoint weights/edge_sam_3x.pth \
+    --ann-file train.json --img-dir images/train/ \
+    --output output/finetune \
+    --epochs 10 \
+    --save-step-freq 500    # Save every 500 steps
+```
+
+This produces `finetune_step_500.pth`, `finetune_step_1000.pth`, etc., in addition to per-epoch checkpoints. Set to `0` (default) to disable step-based saving.
 
 ---
 
@@ -336,6 +374,7 @@ Training:
   --dice-weight         Dice loss weight [default: 5.0]
   --focal-weight        Focal loss weight [default: 0.0]
   --save-freq           Save checkpoint every N epochs [default: 1]
+  --save-step-freq      Save checkpoint every N steps, 0 = disabled [default: 0]
   --print-freq          Print log every N steps [default: 50]
   --seed                Random seed [default: 42]
 ```

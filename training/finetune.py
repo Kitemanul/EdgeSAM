@@ -41,6 +41,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -170,7 +171,8 @@ def compute_loss(low_res_masks, gt_masks, img_size_before_pad, device, args):
 # Train / Validate
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, dataloader, optimizer, epoch, args, distributed, world_size, rank):
+def train_one_epoch(model, dataloader, optimizer, epoch, args, distributed, world_size, rank,
+                    writer, global_step):
     model.mask_decoder.train()
     model.image_encoder.eval()
     model.prompt_encoder.eval()
@@ -218,19 +220,32 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args, distributed, worl
         torch.nn.utils.clip_grad_norm_(model.mask_decoder.parameters(), 0.1)
         optimizer.step()
 
-        loss_sum += batch_loss.item()
-        iou_sum += batch_iou / n_valid
+        loss_val = batch_loss.item()
+        iou_val = batch_iou / n_valid
+        loss_sum += loss_val
+        iou_sum += iou_val
         count += 1
+        global_step += 1
+
+        if rank == 0:
+            writer.add_scalar('train/loss_step', loss_val, global_step)
+            writer.add_scalar('train/mIoU_step', iou_val, global_step)
+            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step)
+
+        if rank == 0 and args.save_step_freq > 0 and global_step % args.save_step_freq == 0:
+            ckpt_path = os.path.join(args.output, f'finetune_step_{global_step}.pth')
+            torch.save(model.state_dict(), ckpt_path)
+            print(f'  [step {global_step}] Saved: {ckpt_path}')
 
         if step % args.print_freq == 0 and rank == 0:
             elapsed = time.time() - start
             eta = elapsed / max(step + 1, 1) * (len(dataloader) - step - 1)
             print(f'  [{epoch}][{step}/{len(dataloader)}]  '
-                  f'loss {batch_loss.item():.4f} (avg {loss_sum / count:.4f})  '
-                  f'mIoU {batch_iou / n_valid:.4f} (avg {iou_sum / count:.4f})  '
+                  f'loss {loss_val:.4f} (avg {loss_sum / count:.4f})  '
+                  f'mIoU {iou_val:.4f} (avg {iou_sum / count:.4f})  '
                   f'eta {datetime.timedelta(seconds=int(eta))}')
 
-    return loss_sum / max(count, 1), iou_sum / max(count, 1)
+    return loss_sum / max(count, 1), iou_sum / max(count, 1), global_step
 
 
 @torch.no_grad()
@@ -290,7 +305,9 @@ def parse_args():
     p.add_argument('--bce-weight', type=float, default=5.0)
     p.add_argument('--dice-weight', type=float, default=5.0)
     p.add_argument('--focal-weight', type=float, default=0.0)
-    p.add_argument('--save-freq', type=int, default=1)
+    p.add_argument('--save-freq', type=int, default=1, help='Save checkpoint every N epochs')
+    p.add_argument('--save-step-freq', type=int, default=0,
+                   help='Save checkpoint every N steps (0 = disabled)')
     p.add_argument('--print-freq', type=int, default=50)
     p.add_argument('--seed', type=int, default=42)
     return p.parse_args()
@@ -330,6 +347,7 @@ def main():
         print(f'  LR           : {args.lr}')
         print(f'  Points / mask: {args.num_points}')
         print(f'  Loss weights : BCE={args.bce_weight} Dice={args.dice_weight} Focal={args.focal_weight}')
+        print(f'  Save step freq: {args.save_step_freq if args.save_step_freq > 0 else "disabled"}')
         print()
 
     # ---- Model ----
@@ -388,8 +406,17 @@ def main():
     if rank == 0:
         print()
 
+    # ---- TensorBoard ----
+    writer = None
+    if rank == 0:
+        tb_dir = os.path.join(args.output, 'tensorboard')
+        writer = SummaryWriter(log_dir=tb_dir)
+        print(f'  TensorBoard  : tensorboard --logdir {tb_dir}')
+        print()
+
     # ---- Training loop ----
     best_iou = 0.0
+    global_step = 0
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -397,19 +424,23 @@ def main():
         if rank == 0:
             print(f'Epoch {epoch}/{args.epochs}  lr={optimizer.param_groups[0]["lr"]:.6f}')
 
-        train_loss, train_iou = train_one_epoch(
+        train_loss, train_iou, global_step = train_one_epoch(
             model, train_loader, optimizer, epoch, args,
-            distributed, world_size, rank)
+            distributed, world_size, rank, writer, global_step)
         scheduler.step()
 
         if rank == 0:
             print(f'  => Train  loss={train_loss:.4f}  mIoU={train_iou:.4f}')
+            writer.add_scalar('train/loss_epoch', train_loss, epoch)
+            writer.add_scalar('train/mIoU_epoch', train_iou, epoch)
 
         val_iou = train_iou
         if val_loader is not None:
             val_loss, val_iou = validate(model, val_loader, args, rank)
             if rank == 0:
                 print(f'  => Val    loss={val_loss:.4f}  mIoU={val_iou:.4f}')
+                writer.add_scalar('val/loss_epoch', val_loss, epoch)
+                writer.add_scalar('val/mIoU_epoch', val_iou, epoch)
 
         if rank == 0 and (epoch % args.save_freq == 0 or epoch == args.epochs - 1):
             ckpt_path = os.path.join(args.output, f'finetune_epoch_{epoch}.pth')
@@ -423,6 +454,7 @@ def main():
                 print(f'  ** New best mIoU={best_iou:.4f} -> {best_path}')
 
     if rank == 0:
+        writer.close()
         print(f'\nDone. Best mIoU: {best_iou:.4f}')
 
     if distributed:
