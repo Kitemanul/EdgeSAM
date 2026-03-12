@@ -134,6 +134,7 @@ class COCOFinetuneDataset(torch.utils.data.Dataset):
             'point_labels': labels,
             'img_size_before_pad': img_size_before_pad,
             'num_prompts': len(masks),
+            'img_id': img_id,
         }
 
     def _dummy_sample(self):
@@ -144,6 +145,7 @@ class COCOFinetuneDataset(torch.utils.data.Dataset):
             'point_labels': torch.ones(1, 1),
             'img_size_before_pad': (self.img_size, self.img_size),
             'num_prompts': 0,
+            'img_id': -1,
         }
 
     def _norm(self, x):
