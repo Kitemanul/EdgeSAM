@@ -605,8 +605,8 @@ def validate(model, dataloader, epoch, args, rank):
     sum_bce     = 0.0
     sum_dice    = 0.0
     sum_focal   = 0.0
-    iou_sum     = 0.0
-    count       = 0
+    all_ious    = []           # collect per-mask IoUs (matching eval_mIoU.py)
+    count       = 0            # image count (for loss averaging)
     saved_count = 0
 
     for batch in dataloader:
@@ -634,17 +634,17 @@ def validate(model, dataloader, epoch, args, rank):
 
             # per-mask IoU at full resolution (matches eval_mIoU.py)
             iou_per  = compute_iou_full_res(low_res_masks, gt_masks, sz)  # [N]
-            mean_iou = iou_per.mean().item()
+            all_ious.append(iou_per.cpu())
 
             sum_total += loss.item()
             sum_bce   += components['bce']
             sum_dice  += components['dice']
             sum_focal += components['focal']
-            iou_sum   += mean_iou
             count     += 1
 
             # ── Save bad predictions ───────────────────────────────────────
-            if mean_iou < args.val_iou_thresh and saved_count < args.val_max_save:
+            img_mean_iou = iou_per.mean().item()
+            if img_mean_iou < args.val_iou_thresh and saved_count < args.val_max_save:
                 N = gt_masks.shape[0]
                 for pi in range(N):
                     if saved_count >= args.val_max_save:
@@ -668,7 +668,13 @@ def validate(model, dataloader, epoch, args, rank):
         'dice':  sum_dice  / n,
         'focal': sum_focal / n,
     }
-    avg_iou = iou_sum / n
+    # Global per-mask mean (same as eval_mIoU.py: equal weight per mask)
+    if all_ious:
+        all_ious_cat = torch.cat(all_ious, dim=0)
+        all_ious_cat = all_ious_cat[~all_ious_cat.isnan()]
+        avg_iou = all_ious_cat.mean().item()
+    else:
+        avg_iou = 0.0
 
     if rank == 0 and saved_count > 0:
         print(f'  => Val bad_preds ({saved_count} saved) → {save_dir}')
