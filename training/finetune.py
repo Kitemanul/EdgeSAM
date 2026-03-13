@@ -151,12 +151,50 @@ def focal_loss(pred, target, valid=None, alpha=0.25, gamma=2.0):
 
 @torch.no_grad()
 def compute_iou_per_mask(pred_logits, gt_mask):
-    """Per-mask IoU.  Returns tensor of shape [N] (N = number of prompts)."""
+    """Per-mask IoU at low resolution (256x256).
+
+    Used during training for quick monitoring.  For accurate evaluation,
+    use ``compute_iou_full_res`` which operates at 1024x1024.
+
+    Returns tensor of shape [N] (N = number of prompts).
+    """
     pred = (pred_logits > 0).float()          # threshold at 0 (= mask_threshold)
     gt = gt_mask.float()
     inter = (pred * gt).sum(dim=(-2, -1))     # [N, 1]
     union = (pred + gt - pred * gt).sum(dim=(-2, -1)).clamp(min=1)
     return (inter / union).squeeze(1)         # [N]
+
+
+@torch.no_grad()
+def compute_iou_full_res(low_res_masks, gt_masks, img_size_before_pad):
+    """Per-mask IoU computed at 1024x1024 (cropped to valid region).
+
+    This matches the resolution used by ``eval_mIoU.py`` and avoids the
+    inflated scores that come from evaluating at 256x256 where boundary
+    errors are hidden.
+
+    Args:
+        low_res_masks:      [N, 1, 256, 256]  logits from the mask decoder
+        gt_masks:           [N, 1024, 1024]    binary GT masks (before padding)
+        img_size_before_pad: (H, W)            image size after resize, before padding
+
+    Returns:
+        iou: tensor of shape [N]
+    """
+    # Upsample prediction to 1024x1024
+    pred_up = F.interpolate(
+        low_res_masks, size=(IMG_SIZE, IMG_SIZE),
+        mode='bilinear', align_corners=False)       # [N, 1, 1024, 1024]
+    pred_up = (pred_up[:, 0] > 0).float()           # [N, 1024, 1024]
+
+    # Crop to valid (un-padded) region
+    h, w = img_size_before_pad
+    pred_crop = pred_up[:, :h, :w]
+    gt_crop = gt_masks[:, :h, :w].float()
+
+    inter = (pred_crop * gt_crop).sum(dim=(-2, -1))
+    union = (pred_crop + gt_crop - pred_crop * gt_crop).sum(dim=(-2, -1)).clamp(min=1)
+    return inter / union                            # [N]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,8 +632,8 @@ def validate(model, dataloader, epoch, args, rank):
             # loss (all components)
             loss, components = compute_round_loss(low_res_masks, gt_low, valid_low, args)
 
-            # per-mask IoU
-            iou_per  = compute_iou_per_mask(low_res_masks, gt_low)  # [N]
+            # per-mask IoU at full resolution (matches eval_mIoU.py)
+            iou_per  = compute_iou_full_res(low_res_masks, gt_masks, sz)  # [N]
             mean_iou = iou_per.mean().item()
 
             sum_total += loss.item()
