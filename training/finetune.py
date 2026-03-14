@@ -804,13 +804,13 @@ def parse_args():
     # Iterative decode
     p.add_argument('--decode-iters',         type=int, default=2,
                    help='Decode rounds per step (1 = single-round, 2 = with correction).')
-    p.add_argument('--num-multimask-outputs', type=int, default=1,
+    p.add_argument('--num-multimask-outputs', type=int, default=3,
                    help='Number of mask candidates (1, 3, or 4). Best is kept.')
 
     # Loss weights
-    p.add_argument('--bce-weight',   type=float, default=5.0)
+    p.add_argument('--bce-weight',   type=float, default=0.0)
     p.add_argument('--dice-weight',  type=float, default=5.0)
-    p.add_argument('--focal-weight', type=float, default=0.0)
+    p.add_argument('--focal-weight', type=float, default=5.0)
     p.add_argument('--iou-weight',   type=float, default=1.0,
                    help='Weight for IoU prediction loss (MSE between predicted '
                         'and actual IoU). Default 1.0.')
