@@ -5,10 +5,10 @@ Strategy — 2-Round Iterative Decode
 Within every training step, each (image, GT-mask) pair is decoded **twice**:
 
   Round 1: 1 positive point sampled inside the GT mask
-           → predict mask  →  BCE + Dice loss₁
+           → predict mask  →  BCE + Dice + IoU loss₁
   Round 2: Round-1 point  +  1 correction point sampled from the error region
            (false-positive or false-negative pixels wrt round-1 prediction)
-           → predict mask  →  BCE + Dice loss₂
+           → predict mask  →  BCE + Dice + IoU loss₂
 
   total_loss = (loss₁ + loss₂) / 2
 
@@ -252,42 +252,54 @@ def decode_masks(model, image_embeddings, point_coords, point_labels, num_multim
 
 def select_best_mask(low_res_masks, iou_pred):
     """When num_multimask > 1, keep the mask with highest predicted IoU.
-    Returns low_res_masks [N, 1, 256, 256].
+
+    Returns:
+        selected_masks: [N, 1, 256, 256]
+        selected_iou:   [N]  — the predicted IoU score for the selected mask
     """
     if low_res_masks.shape[1] == 1:
-        return low_res_masks
+        return low_res_masks, iou_pred.squeeze(1)
     best = iou_pred.argmax(dim=1)                           # [N]
     rng  = torch.arange(low_res_masks.shape[0], device=low_res_masks.device)
-    return low_res_masks[rng, best].unsqueeze(1)            # [N, 1, 256, 256]
+    return low_res_masks[rng, best].unsqueeze(1), iou_pred[rng, best]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared loss computation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_round_loss(low_res_masks, gt_low, valid_low, args):
-    """BCE + Dice (+ optional Focal) at 256×256 resolution for one round.
+def compute_round_loss(low_res_masks, gt_low, valid_low, args,
+                       pred_iou=None):
+    """BCE + Dice (+ optional Focal) + IoU prediction loss at 256×256.
 
     low_res_masks: [N, 1, 256, 256] logits
     gt_low:        [N, 1, 256, 256] binary float (0/1)
     valid_low:     [N, 1, 256, 256] float mask (0 = padding, 1 = valid)
+    pred_iou:      [N] predicted IoU scores (None to skip IoU loss)
 
     Returns:
         total:      scalar tensor  (weighted sum, used for backward)
-        components: dict with float values {'bce', 'dice', 'focal'}
+        components: dict with float values {'bce', 'dice', 'focal', 'iou'}
     """
     device = low_res_masks.device
     l_bce   = torch.tensor(0.0, device=device)
     l_dice  = torch.tensor(0.0, device=device)
     l_focal = torch.tensor(0.0, device=device)
+    l_iou   = torch.tensor(0.0, device=device)
     if args.bce_weight > 0:
         l_bce   = bce_loss(low_res_masks, gt_low, valid_low)   * args.bce_weight
     if args.dice_weight > 0:
         l_dice  = dice_loss(low_res_masks, gt_low, valid_low)  * args.dice_weight
     if args.focal_weight > 0:
         l_focal = focal_loss(low_res_masks, gt_low, valid_low) * args.focal_weight
-    total = l_bce + l_dice + l_focal
-    return total, {'bce': l_bce.item(), 'dice': l_dice.item(), 'focal': l_focal.item()}
+    if args.iou_weight > 0 and pred_iou is not None:
+        # GT IoU: actual overlap between prediction and GT (detached)
+        with torch.no_grad():
+            gt_iou = compute_iou_per_mask(low_res_masks, gt_low)  # [N]
+        l_iou = F.mse_loss(pred_iou, gt_iou) * args.iou_weight
+    total = l_bce + l_dice + l_focal + l_iou
+    return total, {'bce': l_bce.item(), 'dice': l_dice.item(),
+                   'focal': l_focal.item(), 'iou': l_iou.item()}
 
 
 def prepare_gt_and_valid(gt_masks, img_size_before_pad, device):
@@ -372,6 +384,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
     sum_bce   = 0.0
     sum_dice  = 0.0
     sum_focal = 0.0
+    sum_iou_loss = 0.0
     sum_iou   = 0.0
     sum_round = [0.0] * args.decode_iters  # per-round
     count     = 0
@@ -384,6 +397,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
         batch_bce   = 0.0
         batch_dice  = 0.0
         batch_focal = 0.0
+        batch_iou_loss = 0.0
         batch_round = [0.0] * args.decode_iters
         n_valid     = 0
 
@@ -408,9 +422,10 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
             cur_lbls = lbls.clone()   # [N, num_pts]
             total_round_loss = torch.tensor(0.0, device=image.device)
             # Per-component sums for this image (averaged over rounds)
-            img_bce   = 0.0
-            img_dice  = 0.0
-            img_focal = 0.0
+            img_bce      = 0.0
+            img_dice     = 0.0
+            img_focal    = 0.0
+            img_iou_loss = 0.0
             last_masks = None          # logits from the previous round
 
             for round_i in range(args.decode_iters):
@@ -429,17 +444,19 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
                     model, img_emb, cur_pts, cur_lbls,
                     num_multimask=args.num_multimask_outputs)
 
-                low_res_masks = select_best_mask(low_res_masks, iou_pred)
+                low_res_masks, sel_iou = select_best_mask(low_res_masks, iou_pred)
                 last_masks = low_res_masks                 # keep for next round
 
                 # ── Loss for this round ────────────────────────────────────
                 loss_round, components = compute_round_loss(
-                    low_res_masks, gt_low, valid_low, args)
+                    low_res_masks, gt_low, valid_low, args,
+                    pred_iou=sel_iou)
                 total_round_loss = total_round_loss + loss_round / args.decode_iters
 
-                img_bce   += components['bce']   / args.decode_iters
-                img_dice  += components['dice']  / args.decode_iters
-                img_focal += components['focal'] / args.decode_iters
+                img_bce      += components['bce']   / args.decode_iters
+                img_dice     += components['dice']  / args.decode_iters
+                img_focal    += components['focal'] / args.decode_iters
+                img_iou_loss += components['iou']   / args.decode_iters
                 batch_round[round_i] += loss_round.item()
 
             # ── Track IoU (last round prediction) ─────────────────────────
@@ -450,6 +467,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
             batch_bce  += img_bce
             batch_dice += img_dice
             batch_focal += img_focal
+            batch_iou_loss += img_iou_loss
             n_valid += 1
 
         if n_valid == 0:
@@ -472,19 +490,21 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
         optimizer.step()
 
         # ── Step-level scalars ─────────────────────────────────────────────
-        loss_val  = batch_loss.item()
-        iou_val   = batch_iou  / n_valid
-        bce_val   = batch_bce  / n_valid
-        dice_val  = batch_dice / n_valid
-        focal_val = batch_focal / n_valid
+        loss_val     = batch_loss.item()
+        iou_val      = batch_iou     / n_valid
+        bce_val      = batch_bce     / n_valid
+        dice_val     = batch_dice    / n_valid
+        focal_val    = batch_focal   / n_valid
+        iou_loss_val = batch_iou_loss / n_valid
         round_vals = [v / n_valid for v in batch_round]
 
         # Running epoch sums
-        sum_total += loss_val
-        sum_iou   += iou_val
-        sum_bce   += bce_val
-        sum_dice  += dice_val
-        sum_focal += focal_val
+        sum_total    += loss_val
+        sum_iou      += iou_val
+        sum_bce      += bce_val
+        sum_dice     += dice_val
+        sum_focal    += focal_val
+        sum_iou_loss += iou_loss_val
         for i, rv in enumerate(round_vals):
             sum_round[i] += rv
         count       += 1
@@ -496,6 +516,8 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
             writer.add_scalar('train/loss_dice',  dice_val, global_step)
             if args.focal_weight > 0:
                 writer.add_scalar('train/loss_focal', focal_val, global_step)
+            if args.iou_weight > 0:
+                writer.add_scalar('train/loss_iou', iou_loss_val, global_step)
             for i, rv in enumerate(round_vals):
                 writer.add_scalar(f'train/loss_r{i + 1}', rv, global_step)
             writer.add_scalar('train/mIoU', iou_val, global_step)
@@ -514,10 +536,11 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
             print(f'  [{epoch}][{step}/{len(dataloader)}]  '
                   f'loss {loss_val:.4f} (avg {sum_total / count:.4f})  '
                   f'bce {bce_val:.4f}  dice {dice_val:.4f}'
-                  + (f'  focal {focal_val:.4f}' if args.focal_weight > 0 else '') +
-                  f'  {round_str}'
-                  f'  mIoU {iou_val:.4f} (avg {sum_iou / count:.4f})'
-                  f'  eta {datetime.timedelta(seconds=int(eta))}')
+                  + (f'  focal {focal_val:.4f}' if args.focal_weight > 0 else '')
+                  + (f'  iou_l {iou_loss_val:.4f}' if args.iou_weight > 0 else '')
+                  + f'  {round_str}'
+                    f'  mIoU {iou_val:.4f} (avg {sum_iou / count:.4f})'
+                    f'  eta {datetime.timedelta(seconds=int(eta))}')
 
     n = max(count, 1)
     epoch_components = {
@@ -525,6 +548,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
         'bce':   sum_bce   / n,
         'dice':  sum_dice  / n,
         'focal': sum_focal / n,
+        'iou':   sum_iou_loss / n,
         'round': [s / n for s in sum_round],
     }
     return epoch_components, sum_iou / n, global_step
@@ -613,6 +637,7 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
     sum_bce     = 0.0
     sum_dice    = 0.0
     sum_focal   = 0.0
+    sum_iou_l   = 0.0
     all_ious    = []           # collect per-mask IoUs (matching eval_mIoU.py)
     count       = 0            # image count (for loss averaging)
     saved_count = 0
@@ -635,10 +660,11 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
             low_res_masks, iou_pred = decode_masks(
                 model, img_emb, pts, lbls,
                 num_multimask=args.num_multimask_outputs)
-            low_res_masks = select_best_mask(low_res_masks, iou_pred)
+            low_res_masks, sel_iou = select_best_mask(low_res_masks, iou_pred)
 
             # loss (all components)
-            loss, components = compute_round_loss(low_res_masks, gt_low, valid_low, args)
+            loss, components = compute_round_loss(
+                low_res_masks, gt_low, valid_low, args, pred_iou=sel_iou)
 
             # per-mask IoU at full resolution (matches eval_mIoU.py)
             iou_per  = compute_iou_full_res(low_res_masks, gt_masks, sz)  # [N]
@@ -648,6 +674,7 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
             sum_bce   += components['bce']
             sum_dice  += components['dice']
             sum_focal += components['focal']
+            sum_iou_l += components['iou']
             count     += 1
 
             # ── Save bad predictions (val split only) ─────────────────────
@@ -675,6 +702,7 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
         'bce':   sum_bce   / n,
         'dice':  sum_dice  / n,
         'focal': sum_focal / n,
+        'iou':   sum_iou_l / n,
     }
     # Global per-mask mean (same as eval_mIoU.py: equal weight per mask)
     if all_ious:
@@ -717,6 +745,7 @@ def _make_training_strategy(args):
         'loss_bce': args.bce_weight,
         'loss_dice': args.dice_weight,
         'loss_focal': args.focal_weight,
+        'loss_iou': args.iou_weight,
         # data
         'ann_file': args.ann_file,
         'img_dir': args.img_dir,
@@ -782,6 +811,9 @@ def parse_args():
     p.add_argument('--bce-weight',   type=float, default=5.0)
     p.add_argument('--dice-weight',  type=float, default=5.0)
     p.add_argument('--focal-weight', type=float, default=0.0)
+    p.add_argument('--iou-weight',   type=float, default=1.0,
+                   help='Weight for IoU prediction loss (MSE between predicted '
+                        'and actual IoU). Default 1.0.')
 
     # Checkpointing & logging
     p.add_argument('--save-freq',      type=int, default=1,
@@ -966,6 +998,7 @@ def main():
                   f'  bce={train_comps["bce"]:.4f}'
                   f'  dice={train_comps["dice"]:.4f}'
                   + (f'  focal={train_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
+                  + (f'  iou_l={train_comps["iou"]:.4f}' if args.iou_weight > 0 else '')
                   + f'  {round_str}'
                   + f'  mIoU={train_iou:.4f}  (in-training, 256px)')
             if writer is not None:
@@ -974,6 +1007,8 @@ def main():
                 writer.add_scalar('train/loss_dice_epoch',  train_comps['dice'],  epoch)
                 if args.focal_weight > 0:
                     writer.add_scalar('train/loss_focal_epoch', train_comps['focal'], epoch)
+                if args.iou_weight > 0:
+                    writer.add_scalar('train/loss_iou_epoch', train_comps['iou'], epoch)
                 for i, v in enumerate(train_comps['round']):
                     writer.add_scalar(f'train/loss_r{i + 1}_epoch', v, epoch)
                 writer.add_scalar('train/mIoU_epoch', train_iou, epoch)
@@ -988,6 +1023,7 @@ def main():
                       f'  bce={te_comps["bce"]:.4f}'
                       f'  dice={te_comps["dice"]:.4f}'
                       + (f'  focal={te_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
+                      + (f'  iou_l={te_comps["iou"]:.4f}' if args.iou_weight > 0 else '')
                       + f'  mIoU={train_eval_iou:.4f}  (eval mode, 1024px)')
                 if writer is not None:
                     writer.add_scalar('train_eval/loss_total_epoch', te_comps['total'], epoch)
@@ -995,6 +1031,8 @@ def main():
                     writer.add_scalar('train_eval/loss_dice_epoch',  te_comps['dice'],  epoch)
                     if args.focal_weight > 0:
                         writer.add_scalar('train_eval/loss_focal_epoch', te_comps['focal'], epoch)
+                    if args.iou_weight > 0:
+                        writer.add_scalar('train_eval/loss_iou_epoch', te_comps['iou'], epoch)
                     writer.add_scalar('train_eval/mIoU_epoch', train_eval_iou, epoch)
 
         # ── Val eval ──────────────────────────────────────────────────────
@@ -1007,6 +1045,7 @@ def main():
                       f'  bce={val_comps["bce"]:.4f}'
                       f'  dice={val_comps["dice"]:.4f}'
                       + (f'  focal={val_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
+                      + (f'  iou_l={val_comps["iou"]:.4f}' if args.iou_weight > 0 else '')
                       + f'  mIoU={val_iou:.4f}  (eval mode, 1024px)')
                 if writer is not None:
                     writer.add_scalar('val/loss_total_epoch', val_comps['total'], epoch)
@@ -1014,6 +1053,8 @@ def main():
                     writer.add_scalar('val/loss_dice_epoch',  val_comps['dice'],  epoch)
                     if args.focal_weight > 0:
                         writer.add_scalar('val/loss_focal_epoch', val_comps['focal'], epoch)
+                    if args.iou_weight > 0:
+                        writer.add_scalar('val/loss_iou_epoch', val_comps['iou'], epoch)
                     writer.add_scalar('val/mIoU_epoch', val_iou, epoch)
 
         if rank == 0 and (epoch % args.save_freq == 0 or epoch == args.epochs - 1):
