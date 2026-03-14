@@ -30,8 +30,15 @@ recording every hyperparameter needed to reproduce the run:
     ...
   }
 
-Validation
+Evaluation
 ==========
+After each epoch, **both** the training set and the validation set (if
+provided) are evaluated under identical conditions: ``model.eval()`` mode,
+single-round decode (no correction point), full-resolution 1024×1024 IoU.
+This makes the two mIoU numbers directly comparable for diagnosing
+overfitting.  Use ``--train-eval-frac`` (default 1.0) to evaluate only a
+random subset of the training set to save time.
+
 At the end of each validation run, samples whose mean IoU falls below
 ``--val-iou-thresh`` are written to::
 
@@ -81,7 +88,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
@@ -581,18 +588,18 @@ def _save_bad_prediction(save_dir, name, logit_low, gt_mask_1024, iou_val,
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, dataloader, epoch, args, rank):
-    """Evaluate on the val set.
+def validate(model, dataloader, epoch, args, rank, split='val'):
+    """Evaluate on a dataset using identical conditions regardless of split.
 
-    Bad predictions (mean IoU < --val-iou-thresh) are saved to::
+    When *split* is ``'val'``, bad predictions (mean IoU < --val-iou-thresh)
+    are saved to::
 
         <output>/bad_preds/epoch_<N>/
           <img_id>_p<i>_iou<X.XX>_mask.png   — predicted binary mask
           <img_id>_p<i>_iou<X.XX>_gt.png     — GT binary mask (reference)
           <img_id>_p<i>_iou<X.XX>_conf.png   — certainty map
 
-    The confidence map uses the **single-round** prediction (no correction
-    point) so it directly shows what the model is uncertain about.
+    Bad-prediction saving is skipped for ``split='train_eval'``.
 
     Returns:
         components: dict {'total', 'bce', 'dice', 'focal'} — epoch-averaged losses
@@ -600,6 +607,7 @@ def validate(model, dataloader, epoch, args, rank):
     """
     model.eval()
 
+    save_bad = (split == 'val')
     save_dir    = os.path.join(args.output, 'bad_preds', f'epoch_{epoch}')
     sum_total   = 0.0
     sum_bce     = 0.0
@@ -642,9 +650,9 @@ def validate(model, dataloader, epoch, args, rank):
             sum_focal += components['focal']
             count     += 1
 
-            # ── Save bad predictions ───────────────────────────────────────
+            # ── Save bad predictions (val split only) ─────────────────────
             img_mean_iou = iou_per.mean().item()
-            if img_mean_iou < args.val_iou_thresh and saved_count < args.val_max_save:
+            if save_bad and img_mean_iou < args.val_iou_thresh and saved_count < args.val_max_save:
                 N = gt_masks.shape[0]
                 for pi in range(N):
                     if saved_count >= args.val_max_save:
@@ -676,8 +684,8 @@ def validate(model, dataloader, epoch, args, rank):
     else:
         avg_iou = 0.0
 
-    if rank == 0 and saved_count > 0:
-        print(f'  => Val bad_preds ({saved_count} saved) → {save_dir}')
+    if rank == 0 and save_bad and saved_count > 0:
+        print(f'  => {split} bad_preds ({saved_count} saved) → {save_dir}')
 
     model.mask_decoder.train()
     return epoch_components, avg_iou
@@ -789,6 +797,11 @@ def parse_args():
     p.add_argument('--val-max-save',   type=int,   default=100,
                    help='Maximum number of bad predictions saved per epoch.')
 
+    # Train-set evaluation (same conditions as val)
+    p.add_argument('--train-eval-frac', type=float, default=1.0,
+                   help='Fraction of training set to evaluate after each epoch '
+                        '(0.0–1.0, default 1.0 = 100%%).')
+
     return p.parse_args()
 
 
@@ -887,11 +900,36 @@ def main():
             shuffle=False, sampler=val_sampler,
             num_workers=args.num_workers, pin_memory=True,
             collate_fn=collate_fn)
-        if rank == 0:
-            print(f'  Train images  : {len(train_ds)},  Val images: {len(val_ds)}')
+
+    # ── Train-eval loader (same conditions as val) ────────────────────────
+    frac = max(0.0, min(1.0, args.train_eval_frac))
+    if frac > 0:
+        n_total = len(train_ds)
+        n_eval  = max(1, int(n_total * frac))
+        if frac < 1.0:
+            rng_sub = np.random.RandomState(args.seed)
+            indices = rng_sub.choice(n_total, size=n_eval, replace=False).tolist()
+            train_eval_ds = Subset(train_ds, indices)
+        else:
+            train_eval_ds = train_ds
+        train_eval_sampler = (DistributedSampler(train_eval_ds, shuffle=False)
+                              if distributed else None)
+        train_eval_loader = DataLoader(
+            train_eval_ds, batch_size=args.batch_size,
+            shuffle=False, sampler=train_eval_sampler,
+            num_workers=args.num_workers, pin_memory=True,
+            collate_fn=collate_fn)
     else:
-        if rank == 0:
-            print(f'  Train images  : {len(train_ds)}')
+        train_eval_loader = None
+        n_eval = 0
+
+    if rank == 0:
+        parts = [f'  Train images  : {len(train_ds)}']
+        if frac > 0:
+            parts.append(f'  Train-eval    : {n_eval} ({frac * 100:.0f}%)')
+        if val_loader is not None:
+            parts.append(f'  Val images    : {len(val_ds)}')
+        print('\n'.join(parts))
 
     if rank == 0:
         print()
@@ -929,7 +967,7 @@ def main():
                   f'  dice={train_comps["dice"]:.4f}'
                   + (f'  focal={train_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
                   + f'  {round_str}'
-                  + f'  mIoU={train_iou:.4f}')
+                  + f'  mIoU={train_iou:.4f}  (in-training, 256px)')
             if writer is not None:
                 writer.add_scalar('train/loss_total_epoch', train_comps['total'], epoch)
                 writer.add_scalar('train/loss_bce_epoch',   train_comps['bce'],   epoch)
@@ -940,16 +978,36 @@ def main():
                     writer.add_scalar(f'train/loss_r{i + 1}_epoch', v, epoch)
                 writer.add_scalar('train/mIoU_epoch', train_iou, epoch)
 
-        val_iou = train_iou
+        # ── Train-eval: evaluate train set with same conditions as val ────
+        train_eval_iou = train_iou  # fallback if train eval is disabled
+        if train_eval_loader is not None:
+            te_comps, train_eval_iou = validate(
+                model, train_eval_loader, epoch, args, rank, split='train_eval')
+            if rank == 0:
+                print(f'  => TrainE loss={te_comps["total"]:.4f}'
+                      f'  bce={te_comps["bce"]:.4f}'
+                      f'  dice={te_comps["dice"]:.4f}'
+                      + (f'  focal={te_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
+                      + f'  mIoU={train_eval_iou:.4f}  (eval mode, 1024px)')
+                if writer is not None:
+                    writer.add_scalar('train_eval/loss_total_epoch', te_comps['total'], epoch)
+                    writer.add_scalar('train_eval/loss_bce_epoch',   te_comps['bce'],   epoch)
+                    writer.add_scalar('train_eval/loss_dice_epoch',  te_comps['dice'],  epoch)
+                    if args.focal_weight > 0:
+                        writer.add_scalar('train_eval/loss_focal_epoch', te_comps['focal'], epoch)
+                    writer.add_scalar('train_eval/mIoU_epoch', train_eval_iou, epoch)
+
+        # ── Val eval ──────────────────────────────────────────────────────
+        val_iou = train_eval_iou
         if val_loader is not None:
             val_comps, val_iou = validate(
-                model, val_loader, epoch, args, rank)
+                model, val_loader, epoch, args, rank, split='val')
             if rank == 0:
                 print(f'  => Val    loss={val_comps["total"]:.4f}'
                       f'  bce={val_comps["bce"]:.4f}'
                       f'  dice={val_comps["dice"]:.4f}'
                       + (f'  focal={val_comps["focal"]:.4f}' if args.focal_weight > 0 else '')
-                      + f'  mIoU={val_iou:.4f}')
+                      + f'  mIoU={val_iou:.4f}  (eval mode, 1024px)')
                 if writer is not None:
                     writer.add_scalar('val/loss_total_epoch', val_comps['total'], epoch)
                     writer.add_scalar('val/loss_bce_epoch',   val_comps['bce'],   epoch)
