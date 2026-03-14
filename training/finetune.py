@@ -809,8 +809,8 @@ def parse_args():
 
     # Loss weights
     p.add_argument('--bce-weight',   type=float, default=0.0)
-    p.add_argument('--dice-weight',  type=float, default=5.0)
-    p.add_argument('--focal-weight', type=float, default=5.0)
+    p.add_argument('--dice-weight',  type=float, default=1.0)
+    p.add_argument('--focal-weight', type=float, default=20.0)
     p.add_argument('--iou-weight',   type=float, default=1.0,
                    help='Weight for IoU prediction loss (MSE between predicted '
                         'and actual IoU). Default 1.0.')
