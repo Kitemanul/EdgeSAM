@@ -654,6 +654,20 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
     """
     model.eval()
 
+    # Save and fix random state so that validation uses identical point
+    # prompts every epoch, making the mIoU curve purely reflect model
+    # improvement rather than sampling noise.
+    rng_state_py    = random.getstate()
+    rng_state_np    = np.random.get_state()
+    rng_state_torch = torch.random.get_rng_state()
+    rng_state_cuda  = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
     save_bad = (split == 'val')
     save_dir    = os.path.join(args.output, 'bad_preds', f'epoch_{epoch}')
     sum_total   = 0.0
@@ -737,6 +751,13 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
 
     if rank == 0 and save_bad and saved_count > 0:
         print(f'  => {split} bad_preds ({saved_count} saved) → {save_dir}')
+
+    # Restore random state so training randomness is unaffected.
+    random.setstate(rng_state_py)
+    np.random.set_state(rng_state_np)
+    torch.random.set_rng_state(rng_state_torch)
+    if rng_state_cuda is not None:
+        torch.cuda.set_rng_state(rng_state_cuda)
 
     model.mask_decoder.train()
     return epoch_components, avg_iou
