@@ -250,8 +250,16 @@ def decode_masks(model, image_embeddings, point_coords, point_labels, num_multim
     return low_res_masks, iou_pred
 
 
-def select_best_mask(low_res_masks, iou_pred):
-    """When num_multimask > 1, keep the mask with highest predicted IoU.
+def select_best_mask(low_res_masks, iou_pred, gt_low=None):
+    """Pick the best mask from multi-mask output.
+
+    During **training** pass *gt_low* so that the mask with the highest
+    **actual** IoU against the ground truth is selected.  This prevents the
+    not-yet-calibrated IoU head from steering the selection toward a poor
+    mask and creating a vicious cycle.
+
+    During **inference / evaluation** leave *gt_low=None*; the mask with the
+    highest **predicted** IoU is selected (standard SAM behaviour).
 
     Returns:
         selected_masks: [N, 1, 256, 256]
@@ -259,8 +267,22 @@ def select_best_mask(low_res_masks, iou_pred):
     """
     if low_res_masks.shape[1] == 1:
         return low_res_masks, iou_pred.squeeze(1)
-    best = iou_pred.argmax(dim=1)                           # [N]
-    rng  = torch.arange(low_res_masks.shape[0], device=low_res_masks.device)
+
+    rng = torch.arange(low_res_masks.shape[0], device=low_res_masks.device)
+
+    if gt_low is not None:
+        # Training: select by ground-truth IoU (no grad needed)
+        with torch.no_grad():
+            pred_bin = (low_res_masks > 0).float()                   # [N, M, 256, 256]
+            gt_exp   = gt_low.expand_as(pred_bin)                    # [N, M, 256, 256]
+            inter    = (pred_bin * gt_exp).sum(dim=(-2, -1))         # [N, M]
+            union    = (pred_bin + gt_exp - pred_bin * gt_exp).sum(dim=(-2, -1)).clamp(min=1)
+            gt_iou   = inter / union                                 # [N, M]
+        best = gt_iou.argmax(dim=1)                                  # [N]
+    else:
+        # Inference / evaluation: select by predicted IoU
+        best = iou_pred.argmax(dim=1)                                # [N]
+
     return low_res_masks[rng, best].unsqueeze(1), iou_pred[rng, best]
 
 
@@ -444,7 +466,8 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
                     model, img_emb, cur_pts, cur_lbls,
                     num_multimask=args.num_multimask_outputs)
 
-                low_res_masks, sel_iou = select_best_mask(low_res_masks, iou_pred)
+                low_res_masks, sel_iou = select_best_mask(
+                    low_res_masks, iou_pred, gt_low=gt_low)
                 last_masks = low_res_masks                 # keep for next round
 
                 # ── Loss for this round ────────────────────────────────────
