@@ -29,6 +29,19 @@ Usage:
         --num-multimask 4 --multimask-select score --refine-iter 2 \
         --dataset sa --num-samples 100 --output-dir output/compare --top-k 10
 
+    # Custom paths: use --dataset folder with --image-dir and --anno-path
+    #   COCO-format annotation JSON:
+    python scripts/compare_models.py \
+        --models edge_sam:weights/edge_sam.pth edge_sam:weights/edge_sam_3x.pth \
+        --dataset folder --image-dir /data/my_images --anno-path /data/annos.json \
+        --num-samples 50
+
+    #   SA-1B-format per-image JSON directory:
+    python scripts/compare_models.py \
+        --models edge_sam:weights/edge_sam.pth edge_sam:weights/edge_sam_3x.pth \
+        --dataset folder --image-dir /data/images --anno-path /data/annotations \
+        --num-samples 50
+
 Strategy parameters (global flags or per-model JSON):
     prompt_type       : "box" | "point" | "both"  (default: "box")
     point_from        : "point" | "random" | "mask-rand" | "mask-center" | "box-center"
@@ -56,8 +69,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from PIL import Image
+from torchvision.transforms.functional import pil_to_tensor
+
 from edge_sam import sam_model_registry
-from edge_sam.utils.common import cal_iou, sample_point_in_mask, get_centroid_from_mask
+from edge_sam.utils.common import cal_iou, sample_point_in_mask, get_centroid_from_mask, xywh2xyxy
+from edge_sam.utils.transforms import ResizeLongestSide
 
 # Lazy imports for datasets
 _SA1BDataset = None
@@ -78,6 +95,219 @@ def _get_coco_dataset():
         from training.data import COCODataset
         _COCODataset = COCODataset
     return _COCODataset
+
+
+# ---------------------------------------------------------------------------
+# FolderDataset: load from arbitrary image dir + annotation path
+# ---------------------------------------------------------------------------
+
+class FolderDataset(torch.utils.data.Dataset):
+    """Generic dataset that loads images from a directory and annotations from
+    either a COCO-format JSON file or an SA-1B-style per-image JSON directory.
+
+    Supported annotation formats:
+        1. COCO JSON (--anno-path points to a .json file):
+           Standard COCO instances format with 'images', 'annotations' keys.
+           Images are loaded from --image-dir/{file_name}.
+        2. SA-1B directory (--anno-path points to a directory):
+           Each image "foo.jpg" has a corresponding "foo.json" in the annotation
+           directory, with SA-1B format: {"image": {...}, "annotations": [...]}.
+    """
+
+    def __init__(self, image_dir, anno_path, img_size=1024, num_samples=-1,
+                 max_allowed_prompts=-1, fix_seed=True,
+                 pixel_mean=(123.675, 116.28, 103.53),
+                 pixel_std=(58.395, 57.12, 57.375)):
+        super().__init__()
+        self.image_dir = image_dir
+        self.anno_path = anno_path
+        self.img_size = img_size
+        self.max_allowed_prompts = max_allowed_prompts
+        self.fix_seed = fix_seed
+        self.pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
+        self.transform = ResizeLongestSide(img_size)
+
+        if os.path.isfile(anno_path) and anno_path.endswith(".json"):
+            self.mode = "coco"
+            self._prepare_coco()
+        elif os.path.isdir(anno_path):
+            self.mode = "sa1b"
+            self._prepare_sa1b()
+        else:
+            raise ValueError(
+                f"--anno-path must be a COCO .json file or a directory of per-image JSONs, got: {anno_path}")
+
+        if 0 < num_samples < len(self.data):
+            self.data = self.data[:num_samples]
+
+    # -- COCO format ----------------------------------------------------------
+
+    def _prepare_coco(self):
+        from pycocotools import mask as mask_utils  # noqa: F811
+        self._mask_utils = mask_utils
+
+        with open(self.anno_path, "r") as f:
+            anno_json = json.load(f)
+
+        imgs = {img["id"]: img for img in anno_json["images"]}
+        annos = {}
+        for a in anno_json["annotations"]:
+            if a.get("iscrowd", 0):
+                continue
+            annos.setdefault(a["image_id"], []).append(a)
+
+        self.data = []
+        for img_id, img_info in imgs.items():
+            if img_id not in annos:
+                continue
+            file_name = img_info.get("file_name", img_info.get("coco_url", "").split("/")[-1])
+            self.data.append(("coco", img_info, annos[img_id], file_name))
+
+    # -- SA-1B format ---------------------------------------------------------
+
+    def _prepare_sa1b(self):
+        from pycocotools import mask as mask_utils  # noqa: F811
+        self._mask_utils = mask_utils
+
+        import glob as glob_mod
+        from pathlib import Path
+
+        self.data = []
+        for img_path in sorted(glob_mod.glob(os.path.join(self.image_dir, "*"))):
+            ext = os.path.splitext(img_path)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".bmp", ".tiff"):
+                continue
+            name = Path(img_path).stem
+            json_path = os.path.join(self.anno_path, f"{name}.json")
+            if not os.path.exists(json_path):
+                continue
+            self.data.append(("sa1b", img_path, json_path, name))
+
+    # -- common ---------------------------------------------------------------
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        if self.data[idx][0] == "coco":
+            return self._getitem_coco(idx)
+        else:
+            return self._getitem_sa1b(idx)
+
+    def _getitem_coco(self, idx):
+        _, img_info, anno_list, file_name = self.data[idx]
+        img_path = os.path.join(self.image_dir, file_name)
+        img = pil_to_tensor(Image.open(img_path).convert("RGB"))
+        original_size = img.shape[1:]  # (H, W)
+        h, w = img_info["height"], img_info["width"]
+
+        prompt_box_list = []
+        gt_mask_list = []
+        mask_utils = self._mask_utils
+
+        for record in anno_list:
+            prompt_box_list.append(np.asarray(record["bbox"]))
+            segm = record["segmentation"]
+            if isinstance(segm, list):
+                rles = mask_utils.frPyObjects(segm, h, w)
+                rle = mask_utils.merge(rles)
+            elif isinstance(segm["counts"], list):
+                rle = mask_utils.frPyObjects(segm, h, w)
+            else:
+                rle = segm
+            gt_mask_list.append(mask_utils.decode(rle))
+
+        prompt_box = torch.from_numpy(np.stack(prompt_box_list, axis=0))
+        gt_mask = torch.from_numpy(np.stack(gt_mask_list, axis=0))
+
+        img = self.transform.apply_image_torch(img[None].float()).squeeze(0)
+        prompt_box = self.transform.apply_boxes_torch(prompt_box, original_size)
+        gt_mask = self.transform.apply_masks_torch(gt_mask, original_size)
+
+        img_size_before_pad = torch.tensor(img.shape, device=img.device)
+        img = self._pad(self._norm(img))
+        gt_mask = self._pad(gt_mask)
+
+        prompt_box, gt_mask = self._subsample(prompt_box, gt_mask, idx)
+        prompt_box = xywh2xyxy(prompt_box)
+
+        anno = dict(
+            prompt_box=prompt_box, gt_mask=gt_mask,
+            info=dict(file_name=file_name, height=h, width=w),
+            img_size_before_pad=img_size_before_pad,
+        )
+        return img, anno
+
+    def _getitem_sa1b(self, idx):
+        _, img_path, json_path, name = self.data[idx]
+        img = pil_to_tensor(Image.open(img_path).convert("RGB"))
+        original_size = img.shape[1:]
+
+        with open(json_path, "r") as f:
+            anno_json = json.load(f)
+
+        h, w = anno_json["image"]["height"], anno_json["image"]["width"]
+        anno_raw = anno_json["annotations"]
+        mask_utils = self._mask_utils
+
+        prompt_box_list = []
+        prompt_point_list = []
+        gt_mask_list = []
+
+        for record in anno_raw:
+            prompt_box_list.append(np.asarray(record["bbox"]))
+            if "point_coords" in record:
+                prompt_point_list.append(np.asarray(record["point_coords"]))
+            segm = record["segmentation"]
+            if isinstance(segm["counts"], list):
+                rle = mask_utils.frPyObjects(segm, h, w)
+            else:
+                rle = segm
+            gt_mask_list.append(mask_utils.decode(rle))
+
+        prompt_box = torch.from_numpy(np.stack(prompt_box_list, axis=0))
+        gt_mask = torch.from_numpy(np.stack(gt_mask_list, axis=0))
+
+        img = self.transform.apply_image_torch(img[None].float()).squeeze(0)
+        prompt_box = self.transform.apply_boxes_torch(prompt_box, original_size)
+        gt_mask = self.transform.apply_masks_torch(gt_mask, original_size)
+
+        img_size_before_pad = torch.tensor(img.shape, device=img.device)
+        img = self._pad(self._norm(img))
+        gt_mask = self._pad(gt_mask)
+
+        prompt_box, gt_mask = self._subsample(prompt_box, gt_mask, idx)
+        prompt_box = xywh2xyxy(prompt_box)
+
+        anno = dict(
+            prompt_box=prompt_box, gt_mask=gt_mask,
+            info=dict(file_name=os.path.basename(img_path), height=h, width=w),
+            img_size_before_pad=img_size_before_pad,
+        )
+        if prompt_point_list:
+            prompt_point = torch.from_numpy(np.stack(prompt_point_list, axis=0))
+            prompt_point = self.transform.apply_coords_torch(prompt_point, original_size)
+            anno["prompt_point"] = prompt_point
+
+        return img, anno
+
+    def _subsample(self, prompt_box, gt_mask, idx):
+        num_prompts = prompt_box.shape[0]
+        if num_prompts > self.max_allowed_prompts > 0:
+            if self.fix_seed:
+                torch.manual_seed(idx)
+            selected = torch.randint(0, num_prompts, (self.max_allowed_prompts,))
+            prompt_box = prompt_box[selected]
+            gt_mask = gt_mask[selected]
+        return prompt_box, gt_mask
+
+    def _norm(self, x):
+        return (x - self.pixel_mean) / self.pixel_std
+
+    def _pad(self, x):
+        h, w = x.shape[-2:]
+        return F.pad(x, (0, self.img_size - w, 0, self.img_size - h))
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +377,17 @@ def load_model(model_type, checkpoint, device):
 # ---------------------------------------------------------------------------
 
 def build_dataset(args):
-    if args.dataset == "sa":
+    if args.dataset == "folder":
+        if not args.image_dir or not args.anno_path:
+            raise ValueError("--dataset folder requires both --image-dir and --anno-path")
+        dataset = FolderDataset(
+            image_dir=args.image_dir,
+            anno_path=args.anno_path,
+            num_samples=args.num_samples,
+            max_allowed_prompts=args.max_prompts,
+            fix_seed=True,
+        )
+    elif args.dataset == "sa":
         SA1BDataset = _get_sa1b_dataset()
         dataset = SA1BDataset(
             data_root=args.data_root, split="val",
@@ -717,8 +957,16 @@ def main():
                         help="Iterative refinement rounds (sample error points and re-decode)")
 
     # Dataset & output
-    parser.add_argument("--dataset", type=str, default="coco", choices=["sa", "coco", "cocofied_lvis", "lvis"])
-    parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default="coco",
+                        choices=["sa", "coco", "cocofied_lvis", "lvis", "folder"],
+                        help="Dataset type. Use 'folder' with --image-dir/--anno-path for custom data.")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="Root dir for sa/coco/lvis datasets (auto-inferred if omitted)")
+    parser.add_argument("--image-dir", type=str, default=None,
+                        help="Image directory (required when --dataset folder)")
+    parser.add_argument("--anno-path", type=str, default=None,
+                        help="Annotation path: a COCO .json file or SA-1B-style directory "
+                             "(required when --dataset folder)")
     parser.add_argument("--num-samples", type=int, default=100)
     parser.add_argument("--max-prompts", type=int, default=64)
     parser.add_argument("--output-dir", type=str, default="output/compare")
