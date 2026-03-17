@@ -31,7 +31,15 @@ Usage:
 
 Strategy parameters (global flags or per-model JSON):
     prompt_type       : "box" | "point" | "both"  (default: "box")
-    point_from        : "point" | "mask-rand" | "mask-center" | "box-center"  (default: "point")
+    point_from        : "point" | "random" | "mask-rand" | "mask-center" | "box-center"
+                        (default: "point")
+                        - "point"       : use dataset-provided point annotations
+                        - "random"      : uniformly sample N random points inside GT mask
+                        - "mask-rand"   : 1 random point inside GT mask (legacy)
+                        - "mask-center" : mask centroid via distance transform
+                        - "box-center"  : center of bounding box
+    num_points        : int >= 1  (default: 1, number of point prompts per mask,
+                        mainly for point_from="random")
     num_multimask     : 1 | 3 | 4  (default: 1)
     multimask_select  : "score" | "area" | "oracle"  (default: "score")
     refine_iter       : int >= 1  (default: 1, iterative mask refinement rounds)
@@ -78,7 +86,8 @@ def _get_coco_dataset():
 
 DEFAULT_STRATEGY = {
     "prompt_type": "box",         # "box" | "point" | "both"
-    "point_from": "point",        # "point" | "mask-rand" | "mask-center" | "box-center"
+    "point_from": "point",        # "point" | "random" | "mask-rand" | "mask-center" | "box-center"
+    "num_points": 1,              # number of point prompts per mask
     "num_multimask": 1,           # 1, 3, or 4
     "multimask_select": "score",  # "score" | "area" | "oracle"
     "refine_iter": 1,             # >= 1
@@ -91,6 +100,7 @@ def build_strategy(global_args, per_model_json=None):
     # Apply global CLI flags
     strategy["prompt_type"] = global_args.prompt_type
     strategy["point_from"] = global_args.point_from
+    strategy["num_points"] = global_args.num_points
     strategy["num_multimask"] = global_args.num_multimask
     strategy["multimask_select"] = global_args.multimask_select
     strategy["refine_iter"] = global_args.refine_iter
@@ -172,6 +182,40 @@ def build_dataset(args):
 # Prompt preparation
 # ---------------------------------------------------------------------------
 
+def _sample_random_points_in_mask(gt_mask, num_points, device):
+    """Sample num_points random points uniformly from within each GT mask.
+
+    Args:
+        gt_mask: (N, 1, H, W) binary-ish tensor
+        num_points: int, number of points to sample per mask
+        device: torch device
+
+    Returns:
+        points: (N, num_points, 2) in (x, y) format
+        labels: (N, num_points) all ones (foreground)
+    """
+    N = gt_mask.shape[0]
+    all_points = []
+    for i in range(N):
+        mask_i = gt_mask[i, 0]  # (H, W)
+        candidate_indices = mask_i.nonzero()  # (K, 2) in (row, col) = (y, x)
+        if len(candidate_indices) >= num_points:
+            perm = torch.randperm(len(candidate_indices), device=device)[:num_points]
+            selected = candidate_indices[perm]
+        elif len(candidate_indices) > 0:
+            # Fewer mask pixels than requested: sample with replacement
+            indices = torch.randint(0, len(candidate_indices), (num_points,), device=device)
+            selected = candidate_indices[indices]
+        else:
+            selected = torch.zeros(num_points, 2, device=device, dtype=torch.long)
+        # Convert (y, x) -> (x, y)
+        pts = selected.flip(1).float()
+        all_points.append(pts)
+    points = torch.stack(all_points, dim=0)  # (N, num_points, 2)
+    labels = torch.ones(N, num_points, device=device)
+    return points, labels
+
+
 def prepare_prompts(annos, boxes_cat, gt_mask, strategy, device, img_size_pad):
     """Prepare point and box prompts according to strategy.
 
@@ -181,17 +225,31 @@ def prepare_prompts(annos, boxes_cat, gt_mask, strategy, device, img_size_pad):
     """
     prompt_type = strategy["prompt_type"]
     point_from = strategy["point_from"]
+    num_points = strategy["num_points"]
 
     points = None
     boxes = boxes_cat
 
     # Build point prompts based on point_from
     if prompt_type in ("point", "both"):
-        if point_from == "point" and "prompt_point" in annos:
+        if point_from == "random":
+            # Uniformly random N points inside GT mask, controlled by seed
+            pts, labels = _sample_random_points_in_mask(gt_mask, num_points, device)
+            points = (pts, labels)
+        elif point_from == "point" and "prompt_point" in annos:
             pts = torch.cat(annos["prompt_point"], dim=0).to(device)
+            # pts: (N, K, 2) where K is original point count
+            if num_points > 1 and pts.shape[1] < num_points:
+                # Supplement with random mask points
+                extra_pts, extra_labels = _sample_random_points_in_mask(
+                    gt_mask, num_points - pts.shape[1], device)
+                pts = torch.cat([pts, extra_pts], dim=1)
+            elif num_points < pts.shape[1]:
+                pts = pts[:, :num_points]
             labels = torch.ones(pts.shape[:2], device=device)
             points = (pts, labels)
         elif point_from == "mask-rand":
+            # Legacy: 1 random point per mask (ignores num_points for backward compat)
             point_list = []
             for g in gt_mask.squeeze(1):
                 candidate_indices = g.nonzero()
@@ -202,24 +260,31 @@ def prepare_prompts(annos, boxes_cat, gt_mask, strategy, device, img_size_pad):
                     p = torch.zeros(2, device=device)
                 point_list.append(p)
             pts = torch.stack(point_list, dim=0)[:, None]
+            # If num_points > 1, add more random points
+            if num_points > 1:
+                extra_pts, _ = _sample_random_points_in_mask(gt_mask, num_points - 1, device)
+                pts = torch.cat([pts, extra_pts], dim=1)
             labels = torch.ones(pts.shape[:2], device=device)
             points = (pts, labels)
         elif point_from == "mask-center":
             pts = get_centroid_from_mask(gt_mask > 0.5)
+            if num_points > 1:
+                extra_pts, _ = _sample_random_points_in_mask(gt_mask, num_points - 1, device)
+                pts = torch.cat([pts, extra_pts], dim=1)
             labels = torch.ones(pts.shape[:2], device=device)
             points = (pts, labels)
         elif point_from == "box-center":
             cx = (boxes_cat[:, 0] + boxes_cat[:, 2]) / 2
             cy = (boxes_cat[:, 1] + boxes_cat[:, 3]) / 2
             pts = torch.stack([cx, cy], dim=1)[:, None]
+            if num_points > 1:
+                extra_pts, _ = _sample_random_points_in_mask(gt_mask, num_points - 1, device)
+                pts = torch.cat([pts, extra_pts], dim=1)
             labels = torch.ones(pts.shape[:2], device=device)
             points = (pts, labels)
         else:
-            # Fallback: use box center
-            cx = (boxes_cat[:, 0] + boxes_cat[:, 2]) / 2
-            cy = (boxes_cat[:, 1] + boxes_cat[:, 3]) / 2
-            pts = torch.stack([cx, cy], dim=1)[:, None]
-            labels = torch.ones(pts.shape[:2], device=device)
+            # Fallback: random points
+            pts, labels = _sample_random_points_in_mask(gt_mask, num_points, device)
             points = (pts, labels)
 
     # Suppress prompts based on prompt_type
@@ -587,6 +652,7 @@ def print_summary(report):
         parts = [f"prompt={s['prompt_type']}"]
         if s["prompt_type"] in ("point", "both"):
             parts.append(f"point_from={s['point_from']}")
+            parts.append(f"num_points={s['num_points']}")
         parts.append(f"multimask={s['num_multimask']}")
         if s["num_multimask"] > 1:
             parts.append(f"select={s['multimask_select']}")
@@ -637,8 +703,11 @@ def main():
     # Global strategy defaults
     parser.add_argument("--prompt-type", type=str, default="box", choices=["box", "point", "both"])
     parser.add_argument("--point-from", type=str, default="point",
-                        choices=["point", "mask-rand", "mask-center", "box-center"],
-                        help="How to generate point prompts")
+                        choices=["point", "random", "mask-rand", "mask-center", "box-center"],
+                        help="How to generate point prompts. "
+                             "'random' samples N uniform random points inside GT mask.")
+    parser.add_argument("--num-points", type=int, default=1,
+                        help="Number of point prompts per mask (works with all point_from modes)")
     parser.add_argument("--num-multimask", type=int, default=1, choices=[1, 3, 4],
                         help="Number of mask candidates per prompt")
     parser.add_argument("--multimask-select", type=str, default="score",
