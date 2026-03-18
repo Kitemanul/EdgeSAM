@@ -154,12 +154,12 @@ def select_best_mask(masks, scores, gt_mask, strategy):
 @torch.no_grad()
 def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
                    img_dir, strategy, max_masks):
-    """Run one model on the dataset. Returns per-mask IoU and per-image data."""
+    """Run one model on the dataset. Returns per-mask IoU (no heavy data kept)."""
     model = sam_model_registry[model_type](checkpoint=checkpoint)
     model.cuda().eval()
     predictor = SamPredictor(model)
 
-    per_image = {}  # img_id -> { file_name, ious, pred_masks, gt_masks, image }
+    per_image = {}  # img_id -> { file_name, ious, mean_iou }
 
     for img_id in tqdm(img_ids, desc=f"  {model_type}"):
         img_info = images[img_id]
@@ -175,7 +175,7 @@ def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
         if max_masks > 0 and len(anns) > max_masks:
             anns = random.sample(anns, max_masks)
 
-        ious, pred_masks, gt_masks = [], [], []
+        ious = []
         for ann in anns:
             gt = decode_mask(ann["segmentation"], h, w)
             if gt is None or gt.sum() == 0:
@@ -192,19 +192,68 @@ def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
             pred = select_best_mask(masks, scores, gt, strategy["multimask_select"])
             iou = compute_iou(pred, gt)
             ious.append(iou)
-            pred_masks.append((pred.astype(np.uint8) * 255))
-            gt_masks.append((gt.astype(np.uint8) * 255))
 
         if ious:
             per_image[img_id] = dict(
                 file_name=img_info["file_name"],
-                ious=ious, mean_iou=float(np.mean(ious)),
+                ious=ious, mean_iou=float(np.mean(ious)))
+
+    del model, predictor
+    torch.cuda.empty_cache()
+    return per_image
+
+
+@torch.no_grad()
+def generate_visualizations(model_type, checkpoint, images, img_anns,
+                            vis_img_ids, img_dir, strategy, max_masks):
+    """Re-run a model on selected images to produce masks for visualization."""
+    model = sam_model_registry[model_type](checkpoint=checkpoint)
+    model.cuda().eval()
+    predictor = SamPredictor(model)
+
+    vis_data = {}  # img_id -> { pred_masks, gt_masks, image }
+
+    for img_id in tqdm(vis_img_ids, desc=f"  vis {model_type}"):
+        img_info = images[img_id]
+        anns = img_anns[img_id]
+        h, w = img_info["height"], img_info["width"]
+
+        img_path = os.path.join(img_dir, img_info["file_name"])
+        if not os.path.exists(img_path):
+            continue
+        image = np.array(Image.open(img_path).convert("RGB"))
+        predictor.set_image(image)
+
+        if max_masks > 0 and len(anns) > max_masks:
+            anns = random.sample(anns, max_masks)
+
+        pred_masks, gt_masks = [], []
+        for ann in anns:
+            gt = decode_mask(ann["segmentation"], h, w)
+            if gt is None or gt.sum() == 0:
+                continue
+
+            coords, labels = sample_points(
+                gt, strategy["num_points"], strategy["point_strategy"],
+                bbox=ann.get("bbox"))
+
+            masks, scores, _ = predictor.predict(
+                point_coords=coords, point_labels=labels,
+                num_multimask_outputs=strategy["num_multimask"])
+
+            pred = select_best_mask(masks, scores, gt, strategy["multimask_select"])
+            pred_masks.append(pred.astype(np.uint8) * 255)
+            gt_masks.append(gt.astype(np.uint8) * 255)
+
+        if pred_masks:
+            vis_data[img_id] = dict(
+                file_name=img_info["file_name"],
                 pred_masks=pred_masks, gt_masks=gt_masks,
                 image=image)
 
     del model, predictor
     torch.cuda.empty_cache()
-    return per_image
+    return vis_data
 
 
 # ---------------------------------------------------------------------------
@@ -222,14 +271,17 @@ def _make_overlay(img, gt_mask, pred_mask, alpha=0.5):
     return cv2.addWeighted(cv2.cvtColor(base, cv2.COLOR_RGB2BGR), 1 - alpha, ov, alpha, 0)
 
 
-def save_top_masks(output_dir, top_entries, all_results, model_labels, top_k):
+def save_top_masks(output_dir, top_entries, vis_data, model_labels, top_k):
     base_label, cmp_label = model_labels
     vis_dir = os.path.join(output_dir, "top_improvements")
     os.makedirs(vis_dir, exist_ok=True)
 
+    saved = 0
     for rank, (img_id, delta, iou_base, iou_cmp) in enumerate(top_entries[:top_k]):
-        bd = all_results[base_label][img_id]
-        cd = all_results[cmp_label][img_id]
+        if img_id not in vis_data[base_label] or img_id not in vis_data[cmp_label]:
+            continue
+        bd = vis_data[base_label][img_id]
+        cd = vis_data[cmp_label][img_id]
         safe = os.path.splitext(bd["file_name"])[0].replace("/", "_")
         sub = os.path.join(vis_dir, f"rank{rank:03d}_{safe}_delta{delta:.4f}")
         os.makedirs(sub, exist_ok=True)
@@ -246,9 +298,10 @@ def save_top_masks(output_dir, top_entries, all_results, model_labels, top_k):
             cv2.imwrite(os.path.join(sub, f"p{p}_{base_label}_overlay.png"),
                         _make_overlay(bd["image"], gt, bd["pred_masks"][p]))
             cv2.imwrite(os.path.join(sub, f"p{p}_{cmp_label}_overlay.png"),
-                        _make_overlay(bd["image"], gt, cd["pred_masks"][p]))
+                        _make_overlay(cd["image"], gt, cd["pred_masks"][p]))
+        saved += 1
 
-    print(f"Saved {min(len(top_entries), top_k)} visualizations to {vis_dir}")
+    print(f"Saved {saved} visualizations to {vis_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +469,7 @@ def main():
             entries.append((img_id, ic - ib, ib, ic))
         entries.sort(key=lambda x: -x[1])
 
-        save_top_masks(args.output_dir, entries, all_results,
-                       (base_label, cmp_label), args.top_k)
-
-        # Per-image CSV
+        # Per-image CSV (lightweight, no re-inference needed)
         csv_path = os.path.join(args.output_dir, "per_image_iou.csv")
         with open(csv_path, "w") as f:
             f.write("image_id,file_name," +
@@ -433,6 +483,24 @@ def main():
                 vals.append(f"{delta:.6f}")
                 f.write(",".join(vals) + "\n")
         print(f"Per-image IoU saved to {csv_path}")
+
+        # Re-run only on top-K images for visualization (avoids storing
+        # all masks/images in memory during the full evaluation pass)
+        if args.top_k > 0:
+            vis_img_ids = set(img_id for img_id, _, _, _ in entries[:args.top_k])
+            print(f"\nGenerating visualizations for top-{args.top_k} images...")
+
+            vis_data = {}
+            for model_type, ckpt, label in model_specs:
+                strategy = strategies[label]
+                random.seed(args.seed)
+                np.random.seed(args.seed)
+                vis_data[label] = generate_visualizations(
+                    model_type, ckpt, images, img_anns, vis_img_ids,
+                    args.img_dir, strategy, args.max_masks_per_image)
+
+            save_top_masks(args.output_dir, entries, vis_data,
+                           (base_label, cmp_label), args.top_k)
 
 
 if __name__ == "__main__":
