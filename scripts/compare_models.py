@@ -29,6 +29,9 @@ import random
 from collections import defaultdict
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
@@ -211,7 +214,7 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
     model.cuda().eval()
     predictor = SamPredictor(model)
 
-    vis_data = {}  # img_id -> { pred_masks, gt_masks, image }
+    vis_data = {}  # img_id -> { pred_masks, all_pred_masks, scores, gt_masks, image }
 
     for img_id in tqdm(vis_img_ids, desc=f"  vis {model_type}"):
         img_info = images[img_id]
@@ -227,7 +230,7 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
         if max_masks > 0 and len(anns) > max_masks:
             anns = random.sample(anns, max_masks)
 
-        pred_masks, gt_masks = [], []
+        pred_masks, all_pred_masks, all_scores, gt_masks = [], [], [], []
         for ann in anns:
             gt = decode_mask(ann["segmentation"], h, w)
             if gt is None or gt.sum() == 0:
@@ -243,12 +246,17 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
 
             pred = select_best_mask(masks, scores, gt, strategy["multimask_select"])
             pred_masks.append(pred.astype(np.uint8) * 255)
+            all_pred_masks.append((masks > 0).astype(np.uint8) * 255)
+            all_scores.append(scores.copy())
             gt_masks.append(gt.astype(np.uint8) * 255)
 
         if pred_masks:
             vis_data[img_id] = dict(
                 file_name=img_info["file_name"],
-                pred_masks=pred_masks, gt_masks=gt_masks,
+                pred_masks=pred_masks,
+                all_pred_masks=all_pred_masks,
+                all_scores=all_scores,
+                gt_masks=gt_masks,
                 image=image)
 
     del model, predictor
@@ -259,6 +267,58 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
+
+def save_iou_histograms(output_dir, model_labels, all_results):
+    """Save per-mask IoU distribution histograms."""
+    # Collect per-mask IoUs for each model
+    all_ious = {}
+    for label in model_labels:
+        ious = []
+        for d in all_results[label].values():
+            ious.extend(d["ious"])
+        all_ious[label] = np.array(ious) if ious else np.array([0.0])
+
+    bins = np.linspace(0, 1, 51)  # 50 bins from 0 to 1
+
+    # 1) Overlaid histogram comparing all models
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for label in model_labels:
+        arr = all_ious[label]
+        ax.hist(arr, bins=bins, alpha=0.5, label=f"{label} (mIoU={arr.mean()*100:.2f}%)",
+                edgecolor="black", linewidth=0.5)
+    ax.set_xlabel("IoU")
+    ax.set_ylabel("Count")
+    ax.set_title("Per-Mask IoU Distribution")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(output_dir, "iou_histogram.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"IoU histogram saved to {path}")
+
+    # 2) Per-image mean IoU delta histogram (if 2+ models)
+    if len(model_labels) >= 2:
+        base, cmp = model_labels[0], model_labels[-1]
+        common = set(all_results[base]) & set(all_results[cmp])
+        deltas = np.array([
+            all_results[cmp][iid]["mean_iou"] - all_results[base][iid]["mean_iou"]
+            for iid in common
+        ]) if common else np.array([0.0])
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.hist(deltas * 100, bins=51, color="steelblue", edgecolor="black", linewidth=0.5)
+        ax.axvline(0, color="red", linestyle="--", linewidth=1)
+        ax.set_xlabel("Delta mIoU (%)")
+        ax.set_ylabel("Count (images)")
+        ax.set_title(f"Per-Image Mean IoU Delta: {cmp} vs {base}")
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        path = os.path.join(output_dir, "iou_delta_histogram.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"IoU delta histogram saved to {path}")
+
 
 def _make_overlay(img, gt_mask, pred_mask, alpha=0.5):
     h, w = gt_mask.shape[:2]
@@ -299,6 +359,16 @@ def save_top_masks(output_dir, top_entries, vis_data, model_labels, top_k):
                         _make_overlay(bd["image"], gt, bd["pred_masks"][p]))
             cv2.imwrite(os.path.join(sub, f"p{p}_{cmp_label}_overlay.png"),
                         _make_overlay(cd["image"], gt, cd["pred_masks"][p]))
+
+            # Save all multi-mask candidates for each model
+            for model_label, md in [(base_label, bd), (cmp_label, cd)]:
+                if p < len(md["all_pred_masks"]):
+                    masks_arr = md["all_pred_masks"][p]  # (C, H, W)
+                    scores_arr = md["all_scores"][p]     # (C,)
+                    for ci in range(masks_arr.shape[0]):
+                        cv2.imwrite(
+                            os.path.join(sub, f"p{p}_{model_label}_mask{ci}_s{scores_arr[ci]:.4f}.png"),
+                            masks_arr[ci])
         saved += 1
 
     print(f"Saved {saved} visualizations to {vis_dir}")
@@ -456,6 +526,9 @@ def main():
 
     with open(os.path.join(args.output_dir, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
+
+    # IoU distribution histograms
+    save_iou_histograms(args.output_dir, model_labels, all_results)
 
     # Top-K visualizations and CSV
     if len(model_labels) >= 2:
