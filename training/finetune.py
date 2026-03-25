@@ -785,7 +785,9 @@ def _make_training_strategy(args):
                                    ('mask_decoder',   args.freeze_mask_decoder)] if f],
         'trained': [n for n, f in [('image_encoder', args.freeze_image_encoder),
                                     ('prompt_encoder', args.freeze_prompt_encoder),
-                                    ('mask_decoder',   args.freeze_mask_decoder)] if not f],
+                                    ('mask_decoder',   args.freeze_mask_decoder)] if not f]
+                   + (['image_encoder.fuse_stage0/1'] if args.freeze_image_encoder and args.train_fuse_all else []),
+        'train_fuse_all': args.train_fuse_all,
         # optimisation
         'epochs': args.epochs,
         'batch_size_per_gpu': args.batch_size,
@@ -848,6 +850,10 @@ def parse_args():
                    help='Freeze mask decoder (default: False).')
     p.add_argument('--no-freeze-mask-decoder', dest='freeze_mask_decoder', action='store_false',
                    help='Unfreeze mask decoder (default behaviour).')
+    p.add_argument('--train-fuse-all', action='store_true', default=False,
+                   help='When the image encoder is otherwise frozen, keep fuse_stage0 and '
+                        'fuse_stage1 trainable (only effective when the model was built with '
+                        'fuse_all=True and --freeze-image-encoder is set).')
 
     # Training
     p.add_argument('--output',       default='output/finetune')
@@ -959,12 +965,25 @@ def main():
     for p in model.mask_decoder.parameters():
         p.requires_grad = not args.freeze_mask_decoder
 
+    # When encoder is frozen but --train-fuse-all is set, selectively unfreeze
+    # only the newly-added fuse_stage0 / fuse_stage1 layers so they can be
+    # trained as adapters without disturbing the pretrained backbone weights.
+    enc = model.image_encoder
+    if args.freeze_image_encoder and args.train_fuse_all:
+        for attr in ('fuse_stage0', 'fuse_stage1'):
+            module = getattr(enc, attr, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = True
+
     frozen = [n for n, flag in [('image_encoder', args.freeze_image_encoder),
                                  ('prompt_encoder', args.freeze_prompt_encoder),
                                  ('mask_decoder',   args.freeze_mask_decoder)] if flag]
     trained = [n for n, flag in [('image_encoder', args.freeze_image_encoder),
                                   ('prompt_encoder', args.freeze_prompt_encoder),
                                   ('mask_decoder',   args.freeze_mask_decoder)] if not flag]
+    if args.freeze_image_encoder and args.train_fuse_all:
+        trained.append('image_encoder.fuse_stage0/1')
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     if rank == 0:
