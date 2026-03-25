@@ -294,13 +294,14 @@ class RepViT(nn.Module):
         'm3': m3_cfgs
     }
 
-    def __init__(self, arch, img_size=1024, fuse=False, freeze=False,
+    def __init__(self, arch, img_size=1024, fuse=False, fuse_all=False, freeze=False,
                  load_from=None, use_rpn=False, out_indices=None, upsample_mode='bicubic'):
         super(RepViT, self).__init__()
         # setting of inverted residual blocks
         self.cfgs = self.arch_settings[arch]
         self.img_size = img_size
         self.fuse = fuse
+        self.fuse_all = fuse_all and fuse  # fuse_all requires fuse=True
         self.freeze = freeze
         self.use_rpn = use_rpn
         self.out_indices = out_indices
@@ -336,6 +337,17 @@ class RepViT(nn.Module):
                 nn.Conv2d(stage3_channels, 256, kernel_size=1, bias=False),
                 UpSampleLayer(factor=2, mode=upsample_mode),
             ])
+            if self.fuse_all:
+                stage0_channels = _make_divisible(self.cfgs[self.stage_idx[0]][2], 8)
+                stage1_channels = _make_divisible(self.cfgs[self.stage_idx[1]][2], 8)
+                self.fuse_stage0 = OpSequential([
+                    nn.Conv2d(stage0_channels, 256, kernel_size=1, bias=False),
+                    nn.AvgPool2d(kernel_size=4, stride=4),   # 256×256 → 64×64
+                ])
+                self.fuse_stage1 = OpSequential([
+                    nn.Conv2d(stage1_channels, 256, kernel_size=1, bias=False),
+                    nn.AvgPool2d(kernel_size=2, stride=2),   # 128×128 → 64×64
+                ])
             neck_in_channels = 256
         else:
             neck_in_channels = output_channel
@@ -382,6 +394,8 @@ class RepViT(nn.Module):
 
         if self.fuse:
             x = self.fuse_stage2(output_dict['stage2']) + self.fuse_stage3(output_dict['stage3'])
+            if self.fuse_all:
+                x = x + self.fuse_stage0(output_dict['stage0']) + self.fuse_stage1(output_dict['stage1'])
 
         x = self.neck(x)
         output_dict['final'] = x

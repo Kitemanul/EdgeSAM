@@ -57,12 +57,13 @@ def build_sam_vit_b(checkpoint=None, **kwargs):
     return _build_sam(image_encoder, checkpoint, **kwargs)
 
 
-def build_edge_sam(checkpoint=None, upsample_mode="bicubic"):
+def build_edge_sam(checkpoint=None, upsample_mode="bicubic", fuse_all=False):
     image_encoder = RepViT(
         arch="m1",
         img_size=image_size,
         upsample_mode=upsample_mode,
-        fuse=True
+        fuse=True,
+        fuse_all=fuse_all,
     )
     return _build_sam(image_encoder, checkpoint)
 
@@ -172,8 +173,9 @@ def build_sam_from_config(
             lora=lora
         )
 
+    fuse_all = config.DISTILL.FUSE_ALL
     kwargs['upsample_mode'] = config.DISTILL.UPSAMPLE_MODE
-    image_encoder = getattr(modeling, model_type)(fuse=fuse, **kwargs)
+    image_encoder = getattr(modeling, model_type)(fuse=fuse, fuse_all=fuse_all, **kwargs)
 
     if encoder_only:
         return image_encoder

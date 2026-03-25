@@ -397,9 +397,9 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
         train/mIoU         — mean IoU over last round
         train/lr           — learning rate
     """
-    model.mask_decoder.train()
-    model.image_encoder.eval()
-    model.prompt_encoder.eval()
+    model.mask_decoder.train()   if not args.freeze_mask_decoder   else model.mask_decoder.eval()
+    model.image_encoder.train()  if not args.freeze_image_encoder  else model.image_encoder.eval()
+    model.prompt_encoder.train() if not args.freeze_prompt_encoder else model.prompt_encoder.eval()
 
     # Running sums for epoch-level averages
     sum_total = 0.0
@@ -501,15 +501,15 @@ def train_one_epoch(model, dataloader, optimizer, epoch, args,
         optimizer.zero_grad()
         batch_loss.backward()
 
-        # Gradient sync for multi-GPU (manual, since mask_decoder is the only
-        # trainable module and we don't use DDP's automatic sync here)
+        # Gradient sync for multi-GPU (manual, no DDP automatic sync)
         if distributed:
-            for p in model.mask_decoder.parameters():
-                if p.grad is not None:
+            for p in model.parameters():
+                if p.requires_grad and p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                     p.grad /= world_size
 
-        torch.nn.utils.clip_grad_norm_(model.mask_decoder.parameters(), args.clip_grad)
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], args.clip_grad)
         optimizer.step()
 
         # ── Step-level scalars ─────────────────────────────────────────────
@@ -759,7 +759,10 @@ def validate(model, dataloader, epoch, args, rank, split='val'):
     if rng_state_cuda is not None:
         torch.cuda.set_rng_state(rng_state_cuda)
 
-    model.mask_decoder.train()
+    # Restore train/eval modes according to freeze flags
+    model.mask_decoder.train()   if not args.freeze_mask_decoder   else model.mask_decoder.eval()
+    model.image_encoder.train()  if not args.freeze_image_encoder  else model.image_encoder.eval()
+    model.prompt_encoder.train() if not args.freeze_prompt_encoder else model.prompt_encoder.eval()
     return epoch_components, avg_iou
 
 
@@ -777,8 +780,12 @@ def _make_training_strategy(args):
         'decode_iters': args.decode_iters,
         'num_multimask_outputs': args.num_multimask_outputs,
         # frozen components
-        'frozen': ['image_encoder', 'prompt_encoder'],
-        'trained': ['mask_decoder'],
+        'frozen': [n for n, f in [('image_encoder', args.freeze_image_encoder),
+                                   ('prompt_encoder', args.freeze_prompt_encoder),
+                                   ('mask_decoder',   args.freeze_mask_decoder)] if f],
+        'trained': [n for n, f in [('image_encoder', args.freeze_image_encoder),
+                                    ('prompt_encoder', args.freeze_prompt_encoder),
+                                    ('mask_decoder',   args.freeze_mask_decoder)] if not f],
         # optimisation
         'epochs': args.epochs,
         'batch_size_per_gpu': args.batch_size,
@@ -829,6 +836,18 @@ def parse_args():
 
     # Model
     p.add_argument('--checkpoint', required=True, help='EdgeSAM pretrained weights')
+    p.add_argument('--freeze-image-encoder',  action='store_true', default=True,
+                   help='Freeze image encoder (default: True).')
+    p.add_argument('--no-freeze-image-encoder', dest='freeze_image_encoder', action='store_false',
+                   help='Unfreeze image encoder so it is trained jointly.')
+    p.add_argument('--freeze-prompt-encoder', action='store_true', default=True,
+                   help='Freeze prompt encoder (default: True).')
+    p.add_argument('--no-freeze-prompt-encoder', dest='freeze_prompt_encoder', action='store_false',
+                   help='Unfreeze prompt encoder so it is trained jointly.')
+    p.add_argument('--freeze-mask-decoder',  action='store_true', default=False,
+                   help='Freeze mask decoder (default: False).')
+    p.add_argument('--no-freeze-mask-decoder', dest='freeze_mask_decoder', action='store_false',
+                   help='Unfreeze mask decoder (default behaviour).')
 
     # Training
     p.add_argument('--output',       default='output/finetune')
@@ -932,22 +951,31 @@ def main():
     model = sam_model_registry['edge_sam'](checkpoint=args.checkpoint)
     model.cuda()
 
-    # Freeze encoder and prompt encoder; only train mask decoder
+    # Freeze / unfreeze components according to CLI flags
     for p in model.image_encoder.parameters():
-        p.requires_grad = False
+        p.requires_grad = not args.freeze_image_encoder
     for p in model.prompt_encoder.parameters():
-        p.requires_grad = False
+        p.requires_grad = not args.freeze_prompt_encoder
+    for p in model.mask_decoder.parameters():
+        p.requires_grad = not args.freeze_mask_decoder
 
-    n_train = sum(p.numel() for p in model.mask_decoder.parameters() if p.requires_grad)
+    frozen = [n for n, flag in [('image_encoder', args.freeze_image_encoder),
+                                 ('prompt_encoder', args.freeze_prompt_encoder),
+                                 ('mask_decoder',   args.freeze_mask_decoder)] if flag]
+    trained = [n for n, flag in [('image_encoder', args.freeze_image_encoder),
+                                  ('prompt_encoder', args.freeze_prompt_encoder),
+                                  ('mask_decoder',   args.freeze_mask_decoder)] if not flag]
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     if rank == 0:
-        print(f'  Trainable     : {n_train:,} / {n_total:,} '
-              f'({100 * n_train / n_total:.1f}%  — mask decoder only)')
+        print(f'  Frozen        : {", ".join(frozen) or "none"}')
+        print(f'  Trainable     : {", ".join(trained) or "none"} '
+              f'— {n_train:,} / {n_total:,} ({100 * n_train / n_total:.1f}%)')
         print()
 
     # ── Optimizer & scheduler ────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        [p for p in model.mask_decoder.parameters() if p.requires_grad],
+        [p for p in model.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)

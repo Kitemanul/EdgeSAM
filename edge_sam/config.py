@@ -75,6 +75,8 @@ _C.DISTILL.NO_RAND = False
 # size, one way is to fuse features from the last two stages with FPN, the other way is to remove the downsampling in
 # the last stage.
 _C.DISTILL.FUSE = False
+# Fuse stage0 and stage1 high-resolution features into the encoder output (requires FUSE=True).
+_C.DISTILL.FUSE_ALL = False
 # Apply pixel-wise feature distillation. (If the value > 0, then enabled and the value represents the loss weight)
 _C.DISTILL.PIXEL_WISE = -1.0
 # Apply channel-wise feature distillation.
