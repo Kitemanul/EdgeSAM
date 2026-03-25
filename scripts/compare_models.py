@@ -157,12 +157,20 @@ def select_best_mask(masks, scores, gt_mask, strategy):
 @torch.no_grad()
 def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
                    img_dir, strategy, max_masks):
-    """Run one model on the dataset. Returns per-mask IoU (no heavy data kept)."""
+    """Run one model on the dataset.
+
+    Returns:
+        per_image:     img_id -> { file_name, ious, mean_iou }
+        saved_prompts: img_id -> { anns, prompts: [(coords, labels), ...] }
+                       Stores the exact annotations and point coords used so
+                       that generate_visualizations can replay them identically.
+    """
     model = sam_model_registry[model_type](checkpoint=checkpoint)
     model.cuda().eval()
     predictor = SamPredictor(model)
 
-    per_image = {}  # img_id -> { file_name, ious, mean_iou }
+    per_image = {}
+    saved_prompts = {}  # img_id -> { anns: [...], prompts: [(coords, labels)] }
 
     for img_id in tqdm(img_ids, desc=f"  {model_type}"):
         img_info = images[img_id]
@@ -179,6 +187,8 @@ def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
             anns = random.sample(anns, max_masks)
 
         ious = []
+        valid_anns = []
+        prompts = []
         for ann in anns:
             gt = decode_mask(ann["segmentation"], h, w)
             if gt is None or gt.sum() == 0:
@@ -195,21 +205,30 @@ def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
             pred = select_best_mask(masks, scores, gt, strategy["multimask_select"])
             iou = compute_iou(pred, gt)
             ious.append(iou)
+            valid_anns.append(ann)
+            prompts.append((coords.copy(), labels.copy()))
 
         if ious:
             per_image[img_id] = dict(
                 file_name=img_info["file_name"],
                 ious=ious, mean_iou=float(np.mean(ious)))
+            saved_prompts[img_id] = dict(anns=valid_anns, prompts=prompts)
 
     del model, predictor
     torch.cuda.empty_cache()
-    return per_image
+    return per_image, saved_prompts
 
 
 @torch.no_grad()
 def generate_visualizations(model_type, checkpoint, images, img_anns,
-                            vis_img_ids, img_dir, strategy, max_masks):
-    """Re-run a model on selected images to produce masks for visualization."""
+                            vis_img_ids, img_dir, strategy, max_masks,
+                            saved_prompts=None):
+    """Re-run a model on selected images to produce masks for visualization.
+
+    When *saved_prompts* is provided (the dict returned by evaluate_model),
+    the exact same annotations and point coordinates used during evaluation
+    are replayed, so visualized masks correspond to the reported IoU scores.
+    """
     model = sam_model_registry[model_type](checkpoint=checkpoint)
     model.cuda().eval()
     predictor = SamPredictor(model)
@@ -218,7 +237,6 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
 
     for img_id in tqdm(vis_img_ids, desc=f"  vis {model_type}"):
         img_info = images[img_id]
-        anns = img_anns[img_id]
         h, w = img_info["height"], img_info["width"]
 
         img_path = os.path.join(img_dir, img_info["file_name"])
@@ -227,18 +245,30 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
         image = np.array(Image.open(img_path).convert("RGB"))
         predictor.set_image(image)
 
-        if max_masks > 0 and len(anns) > max_masks:
-            anns = random.sample(anns, max_masks)
+        # Replay the exact annotations and prompts used during evaluation.
+        if saved_prompts and img_id in saved_prompts:
+            sp = saved_prompts[img_id]
+            iter_anns = sp["anns"]
+            prompt_list = sp["prompts"]
+        else:
+            # Fallback: re-sample (may not match eval, but keeps old behaviour)
+            iter_anns = img_anns[img_id]
+            if max_masks > 0 and len(iter_anns) > max_masks:
+                iter_anns = random.sample(iter_anns, max_masks)
+            prompt_list = None
 
         pred_masks, all_pred_masks, all_scores, gt_masks = [], [], [], []
-        for ann in anns:
+        for i, ann in enumerate(iter_anns):
             gt = decode_mask(ann["segmentation"], h, w)
             if gt is None or gt.sum() == 0:
                 continue
 
-            coords, labels = sample_points(
-                gt, strategy["num_points"], strategy["point_strategy"],
-                bbox=ann.get("bbox"))
+            if prompt_list is not None:
+                coords, labels = prompt_list[i]
+            else:
+                coords, labels = sample_points(
+                    gt, strategy["num_points"], strategy["point_strategy"],
+                    bbox=ann.get("bbox"))
 
             masks, scores, _ = predictor.predict(
                 point_coords=coords, point_labels=labels,
@@ -503,6 +533,7 @@ def main():
 
     # Evaluate each model
     all_results = {}
+    all_saved_prompts = {}  # label -> saved_prompts from evaluate_model
     for model_type, ckpt, label in model_specs:
         strategy = strategies[label]
         print(f"\nEvaluating [{label}] ({model_type}: {ckpt})")
@@ -512,10 +543,11 @@ def main():
         random.seed(args.seed)
         np.random.seed(args.seed)
 
-        per_image = evaluate_model(
+        per_image, saved_prompts = evaluate_model(
             model_type, ckpt, images, img_anns, img_ids,
             args.img_dir, strategy, args.max_masks_per_image)
         all_results[label] = per_image
+        all_saved_prompts[label] = saved_prompts
 
         ious = [iou for d in per_image.values() for iou in d["ious"]]
         print(f"  mIoU: {np.mean(ious)*100:.2f}% ({len(ious)} masks)")
@@ -566,11 +598,10 @@ def main():
             vis_data = {}
             for model_type, ckpt, label in model_specs:
                 strategy = strategies[label]
-                random.seed(args.seed)
-                np.random.seed(args.seed)
                 vis_data[label] = generate_visualizations(
                     model_type, ckpt, images, img_anns, vis_img_ids,
-                    args.img_dir, strategy, args.max_masks_per_image)
+                    args.img_dir, strategy, args.max_masks_per_image,
+                    saved_prompts=all_saved_prompts[label])
 
             save_top_masks(args.output_dir, entries, vis_data,
                            (base_label, cmp_label), args.top_k)
