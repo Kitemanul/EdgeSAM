@@ -15,6 +15,7 @@ For each GT instance:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from pycocotools import mask as mask_utils
 from tqdm import tqdm
 
@@ -35,6 +36,18 @@ from edge_sam import SamPredictor, sam_model_registry
 class ModelResult:
     name: str
     ious: List[float]
+
+@dataclass
+class InstanceRecord:
+    case_id: int
+    ann_path: str
+    img_path: str
+    ann_index: int
+    point_x: float
+    point_y: float
+    iou_a: float
+    iou_b: float
+    delta: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
+    parser.add_argument(
+        "--num-extreme-cases",
+        type=int,
+        default=10,
+        help="How many best/worst comparison cases to save as images (0 disables)",
+    )
     parser.add_argument("--output-dir", default="output/sa1b_compare", help="Output directory")
     return parser.parse_args()
 
@@ -163,22 +182,23 @@ def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return float(inter) / float(union)
 
 
-def select_mask_iou(
+def select_mask_index_and_iou(
     masks: np.ndarray,
     scores: np.ndarray,
     gt_mask: np.ndarray,
     strategy: str,
-) -> float:
+) -> Tuple[int, float]:
     ious = np.array([compute_iou(m.astype(bool), gt_mask.astype(bool)) for m in masks], dtype=np.float32)
     if strategy == "oracle":
-        return float(ious.max())
+        idx = int(np.argmax(ious))
+        return idx, float(ious[idx])
     if strategy == "score":
         idx = int(np.argmax(scores))
-        return float(ious[idx])
+        return idx, float(ious[idx])
     if strategy == "area":
         areas = np.array([(m > 0).sum() for m in masks], dtype=np.float32)
         idx = int(np.argmax(areas))
-        return float(ious[idx])
+        return idx, float(ious[idx])
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
@@ -248,7 +268,7 @@ def build_predictor(checkpoint: str, device: str) -> SamPredictor:
     return SamPredictor(model)
 
 
-def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[str, float], int, int]:
+def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[str, float], int, int, List[InstanceRecord]]:
     rng = np.random.default_rng(args.seed)
 
     predictor_a = build_predictor(args.checkpoint_a, args.device)
@@ -262,6 +282,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[s
 
     ious_a: List[float] = []
     ious_b: List[float] = []
+    per_instance_records: List[InstanceRecord] = []
     total_images = 0
     total_instances = 0
 
@@ -288,13 +309,13 @@ def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[s
         predictor_a.set_image(image)
         predictor_b.set_image(image)
 
-        records = ann_json.get("annotations", [])
+        records = list(enumerate(ann_json.get("annotations", [])))
         if args.max_masks_per_image > 0 and len(records) > args.max_masks_per_image:
             select_ids = rng.choice(len(records), size=args.max_masks_per_image, replace=False)
             records = [records[i] for i in sorted(select_ids.tolist())]
 
         valid_any = False
-        for record in records:
+        for ann_index, record in records:
             gt_mask = decode_segmentation(record.get("segmentation"), height, width)
             if gt_mask is None or gt_mask.sum() == 0:
                 continue
@@ -314,12 +335,25 @@ def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[s
                 num_multimask_outputs=args.num_multimask_outputs,
             )
 
-            iou_a = select_mask_iou(masks_a, scores_a, gt_mask, args.mask_select_a)
-            iou_b = select_mask_iou(masks_b, scores_b, gt_mask, args.mask_select_b)
+            _, iou_a = select_mask_index_and_iou(masks_a, scores_a, gt_mask, args.mask_select_a)
+            _, iou_b = select_mask_index_and_iou(masks_b, scores_b, gt_mask, args.mask_select_b)
             ious_a.append(iou_a)
             ious_b.append(iou_b)
             total_instances += 1
             valid_any = True
+            per_instance_records.append(
+                InstanceRecord(
+                    case_id=total_instances,
+                    ann_path=ann_path,
+                    img_path=img_path,
+                    ann_index=ann_index,
+                    point_x=x,
+                    point_y=y,
+                    iou_a=iou_a,
+                    iou_b=iou_b,
+                    delta=iou_b - iou_a,
+                )
+            )
             if 0 < args.max_instances <= total_instances:
                 break
 
@@ -350,7 +384,143 @@ def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[s
         summary,
         total_images,
         total_instances,
+        per_instance_records,
     )
+
+
+def make_overlay(image: np.ndarray, mask: np.ndarray, point_x: float, point_y: float, color: Tuple[int, int, int]) -> Image.Image:
+    base = Image.fromarray(image.astype(np.uint8), mode="RGB")
+    overlay = Image.new("RGB", base.size, color)
+    alpha = Image.fromarray((mask.astype(np.uint8) * 110), mode="L")
+    blended = Image.composite(overlay, base, alpha)
+    draw = ImageDraw.Draw(blended)
+    r = 5
+    draw.ellipse((point_x - r, point_y - r, point_x + r, point_y + r), fill=(255, 255, 0), outline=(0, 0, 0), width=1)
+    return blended
+
+
+def save_extreme_case_artifacts(
+    args: argparse.Namespace,
+    case: InstanceRecord,
+    rank_label: str,
+    out_dir: str,
+    predictor_a: SamPredictor,
+    predictor_b: SamPredictor,
+) -> Dict[str, object]:
+    with open(case.ann_path, "r") as f:
+        ann_json = json.load(f)
+    ann = ann_json.get("annotations", [])[case.ann_index]
+
+    image = np.array(Image.open(case.img_path).convert("RGB"))
+    h, w = image.shape[:2]
+    gt_mask = decode_segmentation(ann.get("segmentation"), h, w)
+    if gt_mask is None:
+        raise RuntimeError(f"Cannot decode segmentation for case {case.case_id}")
+
+    point_coords = np.array([[case.point_x, case.point_y]], dtype=np.float32)
+    point_labels = np.array([1], dtype=np.int32)
+
+    predictor_a.set_image(image)
+    predictor_b.set_image(image)
+    masks_a, scores_a, _ = predictor_a.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        num_multimask_outputs=args.num_multimask_outputs,
+    )
+    masks_b, scores_b, _ = predictor_b.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        num_multimask_outputs=args.num_multimask_outputs,
+    )
+    idx_a, _ = select_mask_index_and_iou(masks_a, scores_a, gt_mask, args.mask_select_a)
+    idx_b, _ = select_mask_index_and_iou(masks_b, scores_b, gt_mask, args.mask_select_b)
+    pred_a = masks_a[idx_a].astype(np.uint8)
+    pred_b = masks_b[idx_b].astype(np.uint8)
+
+    case_dir = os.path.join(out_dir, rank_label)
+    os.makedirs(case_dir, exist_ok=True)
+    stem = f"rank_{rank_label}_case_{case.case_id:06d}"
+    case_prefix = os.path.join(case_dir, stem)
+
+    original = Image.fromarray(image.astype(np.uint8), mode="RGB")
+    original_with_point = copy.deepcopy(original)
+    draw = ImageDraw.Draw(original_with_point)
+    r = 5
+    draw.ellipse(
+        (case.point_x - r, case.point_y - r, case.point_x + r, case.point_y + r),
+        fill=(255, 255, 0),
+        outline=(0, 0, 0),
+        width=1,
+    )
+    original_with_point.save(f"{case_prefix}_original.png")
+    Image.fromarray((gt_mask > 0).astype(np.uint8) * 255, mode="L").save(f"{case_prefix}_gt.png")
+    Image.fromarray((pred_a > 0).astype(np.uint8) * 255, mode="L").save(f"{case_prefix}_pred_a.png")
+    Image.fromarray((pred_b > 0).astype(np.uint8) * 255, mode="L").save(f"{case_prefix}_pred_b.png")
+    make_overlay(image, (gt_mask > 0).astype(np.uint8), case.point_x, case.point_y, (0, 255, 0)).save(
+        f"{case_prefix}_overlay_gt.png"
+    )
+    make_overlay(image, (pred_a > 0).astype(np.uint8), case.point_x, case.point_y, (255, 0, 0)).save(
+        f"{case_prefix}_overlay_a.png"
+    )
+    make_overlay(image, (pred_b > 0).astype(np.uint8), case.point_x, case.point_y, (0, 128, 255)).save(
+        f"{case_prefix}_overlay_b.png"
+    )
+
+    record = {
+        "rank_label": rank_label,
+        "case_id": case.case_id,
+        "ann_path": case.ann_path,
+        "img_path": case.img_path,
+        "ann_index": case.ann_index,
+        "point": [case.point_x, case.point_y],
+        "iou_a": case.iou_a,
+        "iou_b": case.iou_b,
+        "delta": case.delta,
+        "artifacts_prefix": case_prefix,
+    }
+    with open(f"{case_prefix}_meta.json", "w") as f:
+        json.dump(record, f, indent=2)
+    return record
+
+
+def save_extreme_cases(args: argparse.Namespace, per_instance_records: List[InstanceRecord]) -> Dict[str, List[Dict[str, object]]]:
+    if args.num_extreme_cases <= 0 or not per_instance_records:
+        return {"best": [], "worst": []}
+
+    sorted_records = sorted(per_instance_records, key=lambda x: x.delta)
+    k = min(args.num_extreme_cases, len(sorted_records))
+    worst = sorted_records[:k]
+    best = list(reversed(sorted_records[-k:]))
+
+    out_dir = os.path.join(args.output_dir, "extreme_cases")
+    predictor_a = build_predictor(args.checkpoint_a, args.device)
+    predictor_b = build_predictor(args.checkpoint_b, args.device)
+    saved_best: List[Dict[str, object]] = []
+    saved_worst: List[Dict[str, object]] = []
+
+    for idx, case in enumerate(tqdm(best, desc="Saving best cases"), start=1):
+        saved_best.append(
+            save_extreme_case_artifacts(
+                args,
+                case,
+                rank_label=f"best_{idx:02d}",
+                out_dir=out_dir,
+                predictor_a=predictor_a,
+                predictor_b=predictor_b,
+            )
+        )
+    for idx, case in enumerate(tqdm(worst, desc="Saving worst cases"), start=1):
+        saved_worst.append(
+            save_extreme_case_artifacts(
+                args,
+                case,
+                rank_label=f"worst_{idx:02d}",
+                out_dir=out_dir,
+                predictor_a=predictor_a,
+                predictor_b=predictor_b,
+            )
+        )
+    return {"best": saved_best, "worst": saved_worst}
 
 
 def main() -> None:
@@ -358,7 +528,7 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     with torch.no_grad():
-        res_a, res_b, cmp_stats, n_images, n_instances = evaluate(args)
+        res_a, res_b, cmp_stats, n_images, n_instances, per_instance_records = evaluate(args)
 
     iou_a = np.array(res_a.ious, dtype=np.float32)
     iou_b = np.array(res_b.ious, dtype=np.float32)
@@ -379,6 +549,7 @@ def main() -> None:
             "max_images": args.max_images,
             "max_masks_per_image": args.max_masks_per_image,
             "max_instances": args.max_instances,
+            "num_extreme_cases": args.num_extreme_cases,
         },
         "dataset": {
             "num_images": n_images,
@@ -388,6 +559,10 @@ def main() -> None:
         "model_b": describe(iou_b),
         "comparison": cmp_stats,
     }
+
+    with torch.no_grad():
+        extreme_cases = save_extreme_cases(args, per_instance_records)
+    summary["extreme_cases"] = extreme_cases
 
     plot_histograms(iou_a, iou_b, args.name_a, args.name_b, args.output_dir)
 
@@ -407,6 +582,8 @@ def main() -> None:
     print(f"Delta (B - A)   : {summary['comparison']['delta_mean']:.4f}")
     print(f"B better ratio  : {summary['comparison']['better_b_ratio']:.3f}")
     print(f"A better ratio  : {summary['comparison']['better_a_ratio']:.3f}")
+    print(f"Saved best/worst: {len(summary['extreme_cases']['best'])}/{len(summary['extreme_cases']['worst'])}")
+    print(f"Extreme dir     : {os.path.join(args.output_dir, 'extreme_cases')}")
     print(f"Artifacts saved : {args.output_dir}")
     print("=" * 70)
 
