@@ -6,7 +6,7 @@ statistics.
 
 Supports multiple point sampling strategies:
   - random:  N random points from inside the GT mask (default)
-  - center:  centroid of the GT mask
+  - center:  point inside the GT mask farthest from the mask boundary
   - bbox_center: center of the bounding box
 
 Usage:
@@ -36,6 +36,7 @@ import argparse
 import random
 from collections import defaultdict
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -82,29 +83,45 @@ def decode_mask(segm, h, w):
     return mask_utils.decode(rle)
 
 
-def sample_points(binary_mask, num_points, strategy, bbox=None):
+def sample_points(binary_mask, num_points, strategy, bbox=None, ann=None):
     """Sample point prompts from a GT mask.
 
     Args:
         binary_mask: [H, W] uint8 numpy array.
         num_points: Number of points to sample.
         strategy: 'random', 'center', or 'bbox_center'.
+            'center' reads ann['center_point'] (pre-computed largest-inscribed-
+            circle centre).  Run scripts/add_center_points.py to add this field.
         bbox: [x, y, w, h] COCO format bounding box (for bbox_center).
+        ann: annotation dict (required when strategy='center').
 
     Returns:
         point_coords: [N, 2] array in (x, y) pixel format.
         point_labels: [N] array, all 1 (positive).
     """
-    if strategy == 'center':
-        ys, xs = np.where(binary_mask > 0)
-        cx, cy = float(xs.mean()), float(ys.mean())
-        point_coords = np.array([[cx, cy]] * num_points, dtype=np.float32)
+    ys, xs = np.where(binary_mask > 0)
+    if len(xs) == 0:
+        point_coords = np.zeros((num_points, 2), dtype=np.float32)
+    elif strategy == 'center':
+        if ann is None or 'center_point' not in ann:
+            raise ValueError(
+                "strategy='center' requires ann['center_point']. "
+                "Run scripts/add_center_points.py to pre-compute centres.")
+        cx, cy = ann['center_point']
+        center = np.array([[float(cx), float(cy)]], dtype=np.float32)
+        if num_points == 1:
+            point_coords = center
+        else:
+            extra = num_points - 1
+            indices = [random.randint(0, len(xs) - 1) for _ in range(extra)]
+            extra_coords = np.array(
+                [[float(xs[i]), float(ys[i])] for i in indices], dtype=np.float32)
+            point_coords = np.concatenate([center, extra_coords], axis=0)
     elif strategy == 'bbox_center' and bbox is not None:
         x, y, w, h = bbox
         cx, cy = x + w / 2, y + h / 2
         point_coords = np.array([[cx, cy]] * num_points, dtype=np.float32)
     else:  # random
-        ys, xs = np.where(binary_mask > 0)
         indices = [random.randint(0, len(xs) - 1) for _ in range(num_points)]
         point_coords = np.array(
             [[float(xs[i]), float(ys[i])] for i in indices], dtype=np.float32)
@@ -180,7 +197,7 @@ def main():
 
             point_coords, point_labels = sample_points(
                 gt_mask, args.num_points, args.point_strategy,
-                bbox=ann.get('bbox'))
+                bbox=ann.get('bbox'), ann=ann)
 
             masks, scores, _ = predictor.predict(
                 point_coords=point_coords,

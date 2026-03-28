@@ -60,9 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name-b", default="model_b", help="Display name for model B")
     parser.add_argument(
         "--point-strategy",
-        default="geometric_center",
-        choices=["random", "geometric_center"],
-        help="Point sampling strategy",
+        default="center",
+        choices=["random", "center"],
+        help="Point sampling strategy ('center' reads ann['center_point'])",
     )
     parser.add_argument(
         "--num-multimask-outputs",
@@ -124,43 +124,8 @@ def decode_segmentation(segm, height: int, width: int) -> np.ndarray | None:
 
 
 
-def farthest_point_from_boundary(mask: np.ndarray) -> Tuple[float, float]:
-    h, w = mask.shape
-    fg = (mask > 0).astype(np.uint8)
-
-    # Multi-source BFS initialized from background pixels.
-    from collections import deque
-
-    inf = np.iinfo(np.int32).max
-    dist = np.full((h, w), inf, dtype=np.int32)
-    q = deque()
-
-    bg_ys, bg_xs = np.where(fg == 0)
-    for y, x in zip(bg_ys.tolist(), bg_xs.tolist()):
-        dist[y, x] = 0
-        q.append((y, x))
-
-    # If mask fills whole image (rare), fallback to image center.
-    if not q:
-        return float(w / 2.0), float(h / 2.0)
-
-    neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
-    while q:
-        y, x = q.popleft()
-        nd = dist[y, x] + 1
-        for dy, dx in neighbors:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w and dist[ny, nx] > nd:
-                dist[ny, nx] = nd
-                q.append((ny, nx))
-
-    fg_ys, fg_xs = np.where(fg > 0)
-    fg_d = dist[fg_ys, fg_xs]
-    best = int(np.argmax(fg_d))
-    return float(fg_xs[best]), float(fg_ys[best])
-
-
-def sample_prompt_point(mask: np.ndarray, strategy: str, rng: np.random.Generator) -> Tuple[float, float]:
+def sample_prompt_point(mask: np.ndarray, strategy: str, rng: np.random.Generator,
+                        ann: dict | None = None) -> Tuple[float, float]:
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         raise ValueError("Empty mask cannot provide prompt point")
@@ -169,9 +134,13 @@ def sample_prompt_point(mask: np.ndarray, strategy: str, rng: np.random.Generato
         idx = int(rng.integers(0, len(xs)))
         return float(xs[idx]), float(ys[idx])
 
-    # geometric_center: pick the interior pixel with maximum L1 distance
-    # to background (multi-source BFS distance transform).
-    return farthest_point_from_boundary(mask)
+    # center: read pre-computed largest-inscribed-circle centre from annotation.
+    if ann is None or 'center_point' not in ann:
+        raise ValueError(
+            "strategy='center' requires ann['center_point']. "
+            "Run scripts/add_center_points.py to pre-compute centres.")
+    cx, cy = ann['center_point']
+    return float(cx), float(cy)
 
 
 def compute_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
@@ -320,7 +289,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[ModelResult, ModelResult, Dict[s
             if gt_mask is None or gt_mask.sum() == 0:
                 continue
 
-            x, y = sample_prompt_point(gt_mask, args.point_strategy, rng)
+            x, y = sample_prompt_point(gt_mask, args.point_strategy, rng, ann=record)
             point_coords = np.array([[x, y]], dtype=np.float32)
             point_labels = np.array([1], dtype=np.int32)
 

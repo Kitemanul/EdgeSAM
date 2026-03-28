@@ -869,6 +869,11 @@ def parse_args():
                    help='Max GT masks kept per image.')
     p.add_argument('--num-points',   type=int,   default=1,
                    help='Positive points sampled per mask for the initial prompt.')
+    p.add_argument('--val-point-strategy', default='random', choices=['random', 'center'],
+                   help="Point sampling strategy used during epoch-end evaluation. "
+                        "'center' reads ann['center_point'] from the annotation file "
+                        "(requires running scripts/add_center_points.py first). "
+                        "Training always uses random sampling. (default: random)")
 
     # Iterative decode
     p.add_argument('--decode-iters',         type=int, default=2,
@@ -1016,7 +1021,8 @@ def main():
         val_ds = COCOFinetuneDataset(
             ann_file=args.val_ann_file, img_dir=args.val_img_dir,
             max_prompts_per_image=args.max_prompts,
-            num_points_per_mask=args.num_points)
+            num_points_per_mask=args.num_points,
+            point_strategy=args.val_point_strategy)
         val_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else None
         val_loader  = DataLoader(
             val_ds, batch_size=args.batch_size,
@@ -1027,14 +1033,20 @@ def main():
     # ── Train-eval loader (same conditions as val) ────────────────────────
     frac = max(0.0, min(1.0, args.train_eval_frac))
     if frac > 0:
-        n_total = len(train_ds)
+        # Build a separate dataset so eval point strategy is independent of training.
+        _train_eval_base = COCOFinetuneDataset(
+            ann_file=args.ann_file, img_dir=args.img_dir,
+            max_prompts_per_image=args.max_prompts,
+            num_points_per_mask=args.num_points,
+            point_strategy=args.val_point_strategy)
+        n_total = len(_train_eval_base)
         n_eval  = max(1, int(n_total * frac))
         if frac < 1.0:
             rng_sub = np.random.RandomState(args.seed)
             indices = rng_sub.choice(n_total, size=n_eval, replace=False).tolist()
-            train_eval_ds = Subset(train_ds, indices)
+            train_eval_ds = Subset(_train_eval_base, indices)
         else:
-            train_eval_ds = train_ds
+            train_eval_ds = _train_eval_base
         train_eval_sampler = (DistributedSampler(train_eval_ds, shuffle=False)
                               if distributed else None)
         train_eval_loader = DataLoader(

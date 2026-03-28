@@ -26,12 +26,16 @@ class COCOFinetuneDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, ann_file, img_dir, img_size=1024,
-                 max_prompts_per_image=16, num_points_per_mask=1):
+                 max_prompts_per_image=16, num_points_per_mask=1,
+                 point_strategy='random'):
         super().__init__()
         self.img_dir = img_dir
         self.img_size = img_size
         self.max_prompts_per_image = max_prompts_per_image
         self.num_points_per_mask = num_points_per_mask
+        if point_strategy not in ('random', 'center'):
+            raise ValueError(f"point_strategy must be 'random' or 'center', got '{point_strategy}'")
+        self.point_strategy = point_strategy
         self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
         self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
         self.transform = ResizeLongestSide(img_size)
@@ -69,8 +73,22 @@ class COCOFinetuneDataset(torch.utils.data.Dataset):
             return None
         return mask_utils.decode(rle)
 
-    def _sample_points(self, binary_mask):
-        """Sample random positive points from inside the mask."""
+    def _sample_points(self, binary_mask, ann=None):
+        """Sample positive points from inside the mask.
+
+        When self.point_strategy == 'center', reads the pre-computed
+        largest-inscribed-circle centre from ann['center_point'].
+        """
+        if self.point_strategy == 'center':
+            if ann is None or 'center_point' not in ann:
+                raise ValueError(
+                    "point_strategy='center' requires ann['center_point']. "
+                    "Run scripts/add_center_points.py to pre-compute centres.")
+            cx, cy = ann['center_point']
+            pts  = [[float(cx), float(cy)]] * self.num_points_per_mask
+            lbls = [1] * self.num_points_per_mask
+            return pts, lbls
+
         ys, xs = np.where(binary_mask > 0)
         pts, lbls = [], []
         for _ in range(self.num_points_per_mask):
@@ -95,7 +113,7 @@ class COCOFinetuneDataset(torch.utils.data.Dataset):
             if binary_mask is None or binary_mask.sum() == 0:
                 continue
             masks.append(binary_mask)
-            pts, lbls = self._sample_points(binary_mask)
+            pts, lbls = self._sample_points(binary_mask, ann=ann)
             points.append(pts)
             labels.append(lbls)
 

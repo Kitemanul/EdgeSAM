@@ -57,13 +57,23 @@ def build_sam_vit_b(checkpoint=None, **kwargs):
     return _build_sam(image_encoder, checkpoint, **kwargs)
 
 
-def build_edge_sam(checkpoint=None, upsample_mode="bicubic", fuse_all=False):
+def build_edge_sam(checkpoint=None, upsample_mode="bicubic"):
     image_encoder = RepViT(
         arch="m1",
         img_size=image_size,
         upsample_mode=upsample_mode,
         fuse=True,
-        fuse_all=fuse_all,
+    )
+    return _build_sam(image_encoder, checkpoint)
+
+
+def build_edge_sam_fuse_all(checkpoint=None, upsample_mode="bicubic"):
+    image_encoder = RepViT(
+        arch="m1",
+        img_size=image_size,
+        upsample_mode=upsample_mode,
+        fuse=True,
+        fuse_all=True,
     )
     return _build_sam(image_encoder, checkpoint)
 
@@ -74,6 +84,7 @@ sam_model_registry = {
     "vit_l": build_sam_vit_l,
     "vit_b": build_sam_vit_b,
     "edge_sam": build_edge_sam,
+    "edge_sam_fuse_all": build_edge_sam_fuse_all,
 }
 build_sam = build_edge_sam
 

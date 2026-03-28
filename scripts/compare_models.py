@@ -102,11 +102,14 @@ def decode_mask(segm, h, w):
     return mask_utils.decode(rle)
 
 
-def sample_points(binary_mask, num_points, strategy, bbox=None):
+def sample_points(binary_mask, num_points, strategy, bbox=None, ann=None):
     if strategy == "center":
-        ys, xs = np.where(binary_mask > 0)
-        cx, cy = float(xs.mean()), float(ys.mean())
-        coords = np.array([[cx, cy]] * num_points, dtype=np.float32)
+        if ann is None or 'center_point' not in ann:
+            raise ValueError(
+                "strategy='center' requires ann['center_point']. "
+                "Run scripts/add_center_points.py to pre-compute centres.")
+        cx, cy = ann['center_point']
+        coords = np.array([[float(cx), float(cy)]] * num_points, dtype=np.float32)
     elif strategy == "bbox_center" and bbox is not None:
         x, y, w, h = bbox
         cx, cy = x + w / 2, y + h / 2
@@ -196,7 +199,7 @@ def evaluate_model(model_type, checkpoint, images, img_anns, img_ids,
 
             coords, labels = sample_points(
                 gt, strategy["num_points"], strategy["point_strategy"],
-                bbox=ann.get("bbox"))
+                bbox=ann.get("bbox"), ann=ann)
 
             masks, scores, _ = predictor.predict(
                 point_coords=coords, point_labels=labels,
@@ -268,7 +271,7 @@ def generate_visualizations(model_type, checkpoint, images, img_anns,
             else:
                 coords, labels = sample_points(
                     gt, strategy["num_points"], strategy["point_strategy"],
-                    bbox=ann.get("bbox"))
+                    bbox=ann.get("bbox"), ann=ann)
 
             masks, scores, _ = predictor.predict(
                 point_coords=coords, point_labels=labels,
