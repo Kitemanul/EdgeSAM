@@ -1,18 +1,18 @@
 #!/usr/bin/env python
 """
-Diagnose NPU compilation failures by exporting 3 decoder sub-modules.
+Export 3 NPU-compatible decoder sub-modules for EdgeSAM.
 
-Splits the EdgeSAM decoder into 3 structural parts and exports each as
-an independent ONNX model WITHOUT any NPU fixes.  Compile each with your
-NPU toolchain; pass/fail pinpoints which subsystem is problematic.
+Splits the EdgeSAM decoder into 3 structural parts with NPU fixes applied,
+and exports each as an independent ONNX model.  All 3 parts have been
+confirmed to pass NPU compilation.
 
-  Part 1 — Prompt Encoding:
-    point_coords + point_labels -> sparse_embedding
+  Part 1 — Prompt Encoding (Fix A: PE on CPU, Fix B: float label masks):
+    point_embedding_pe + point_labels -> sparse_embedding
 
-  Part 2 — Transformer:
+  Part 2 — Transformer (no fixes needed):
     image_embeddings + sparse_embedding -> (hs, src)
 
-  Part 3 — Mask Head:
+  Part 3 — Mask Head (Fix C: Slice+Reshape, Fix E: sigmoid stability score):
     (hs, src) -> (scores, masks)
 
 Usage:
@@ -192,28 +192,6 @@ class Part2_Transformer(nn.Module):
 
 
 # ============================================================
-# NPU-safe GELU (tanh approximation, avoids Erf op)
-# ============================================================
-
-class _GELUTanh(nn.Module):
-    """GELU via tanh approximation. Avoids the Erf ONNX op."""
-
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(
-            0.7978845608028654 * (x + 0.044715 * x * x * x)
-        ))
-
-
-def _replace_gelu(module):
-    """Replace all nn.GELU in a module tree with _GELUTanh."""
-    for attr in list(module._modules.keys()):
-        if isinstance(module._modules[attr], nn.GELU):
-            module._modules[attr] = _GELUTanh()
-        else:
-            _replace_gelu(module._modules[attr])
-
-
-# ============================================================
 # Part 3: Mask Head
 # ============================================================
 
@@ -225,8 +203,9 @@ class Part3_MaskHead(nn.Module):
     stability score computation.
 
     NPU fixes applied:
-    - nn.GELU replaced with tanh approximation (avoids Erf op)
+    - Gather → Slice + Reshape for tensor indexing
     - Stability score uses float arithmetic instead of bool ops
+    - nn.GELU (Erf) is kept as-is — ablation confirmed Erf is NPU-safe
     """
 
     def __init__(self, sam):
@@ -238,9 +217,6 @@ class Part3_MaskHead(nn.Module):
         self.num_mask_tokens = md.num_mask_tokens
         self.mask_threshold = sam.mask_threshold
         self.stability_score_offset = 1.0
-
-        # Replace nn.GELU -> tanh approximation (eliminates Erf op)
-        _replace_gelu(self.output_upscaling)
 
     @staticmethod
     def _stability_score_npu(masks, mask_threshold, threshold_offset):
