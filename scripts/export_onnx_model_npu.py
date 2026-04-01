@@ -1,12 +1,14 @@
 """
 Export EdgeSAM encoder and decoder to NPU-compatible ONNX (opset 11).
 
-The decoder applies 5 NPU compatibility fixes to eliminate unsupported ops:
+The decoder applies 4 NPU compatibility fixes to eliminate unsupported ops:
   Fix 1: Sin/Cos  → PE pre-computed on CPU (positional encoding)
   Fix 2: Equal/Cast/Abs → float arithmetic for label comparison
   Fix 3: Gather  → Slice + Reshape for tensor indexing
-  Fix 4: Erf     → GELU replaced with tanh approximation
-  Fix 5: bool ReduceSum → sigmoid step for stability score
+  Fix 4: bool ReduceSum → sigmoid step for stability score
+
+Note: Erf (nn.GELU) does NOT need replacement — ablation confirmed NPU
+compiles Erf correctly (Encoder has 27 Erf ops, all pass).
 
 No ONNX post-processing is applied (no graph simplification, no int64→int32
 conversion). The 3-part split testing confirmed that raw PyTorch ONNX export
@@ -75,31 +77,6 @@ def compute_point_pe(sam, point_coords):
 
 
 # ============================================================
-# NPU-safe GELU (tanh approximation, avoids Erf op)
-# ============================================================
-
-class _GELUTanh(nn.Module):
-    """GELU via tanh approximation.  Avoids the Erf ONNX op."""
-
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(
-            0.7978845608028654 * (x + 0.044715 * x * x * x)
-        ))
-
-
-def _replace_gelu(module):
-    """Replace all nn.GELU in a module tree with _GELUTanh."""
-    count = 0
-    for attr in list(module._modules.keys()):
-        if isinstance(module._modules[attr], nn.GELU):
-            module._modules[attr] = _GELUTanh()
-            count += 1
-        else:
-            count += _replace_gelu(module._modules[attr])
-    return count
-
-
-# ============================================================
 # Merged NPU-Safe Decoder
 # ============================================================
 
@@ -107,9 +84,9 @@ class NpuSafeDecoder(nn.Module):
     """EdgeSAM decoder with all NPU compatibility fixes applied.
 
     Merges 3 functional stages into a single module:
-      Stage 1 — Label Embedding: select per-label embeddings
+      Stage 1 — Label Embedding: select per-label embeddings (Fix 1, 2)
       Stage 2 — Transformer: two-way attention between tokens and image
-      Stage 3 — Mask Head: upscale, hypernetwork MLPs, score
+      Stage 3 — Mask Head: upscale, hypernetwork MLPs, score (Fix 3, 4)
 
     Inputs:
         image_embeddings:  [1, 256, 64, 64]  — from encoder
@@ -159,11 +136,6 @@ class NpuSafeDecoder(nn.Module):
         self._upscale_c = self._embed_dim // 8                      # 32
         self._upscale_spatial = (self._embed_h * 4) * (self._embed_w * 4)  # 65536
 
-        # Fix 4: Replace GELU → tanh approximation in output_upscaling
-        gelu_count = _replace_gelu(self.output_upscaling)
-        if gelu_count > 0:
-            print(f"  [Fix 4] Replaced {gelu_count} nn.GELU → tanh approximation")
-
     # --- Fix 2: NPU-safe float equality (no Equal/Cast/Abs) ---
 
     @staticmethod
@@ -172,7 +144,7 @@ class NpuSafeDecoder(nn.Module):
         diff = x - val
         return torch.relu(1.0 - diff * diff)
 
-    # --- Fix 5: NPU-safe stability score (no bool ReduceSum) ---
+    # --- Fix 4: NPU-safe stability score (no bool ReduceSum) ---
 
     @staticmethod
     def _stability_score_npu(masks, mask_threshold, threshold_offset):
@@ -224,7 +196,7 @@ class NpuSafeDecoder(nn.Module):
             1, self._embed_dim, self._embed_h, self._embed_w
         )
 
-        # Upscale mask embeddings  (Fix 4: GELU already replaced)
+        # Upscale mask embeddings (nn.GELU/Erf is NPU-safe, no replacement needed)
         upscaled = self.output_upscaling(src)
 
         # Hypernetwork MLPs  (Fix 3: Slice+Reshape instead of Gather)
@@ -243,7 +215,7 @@ class NpuSafeDecoder(nn.Module):
 
         # Scores
         if self.use_stability_score:
-            # Fix 5: sigmoid-based stability score
+            # Fix 4: sigmoid-based stability score
             scores = self._stability_score_npu(
                 masks, self.mask_threshold, self.stability_score_offset
             )
@@ -380,7 +352,7 @@ def _print_onnx_summary(onnx_path):
         dt = dtype_names.get(out.type.tensor_type.elem_type, "?")
         print(f"  Output {out.name}: {dt} {shape}")
 
-    npu_bad = {"Sin", "Cos", "Erf", "Abs", "Gather"}
+    npu_bad = {"Sin", "Cos", "Abs", "Gather", "GatherND", "ScatterND", "NonZero", "Greater"}
     found = npu_bad & set(ops.keys())
     if found:
         print(f"  WARNING: NPU-incompatible ops present: {', '.join(sorted(found))}")
@@ -431,7 +403,7 @@ def export_encoder(sam, args):
 
 def export_decoder(sam, args):
     """Export merged NPU-safe decoder to ONNX."""
-    print("Building NPU-safe decoder (5 fixes applied)...")
+    print("Building NPU-safe decoder (4 fixes applied)...")
     decoder = NpuSafeDecoder(
         sam, use_stability_score=args.use_stability_score
     )
