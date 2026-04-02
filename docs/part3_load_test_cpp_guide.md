@@ -13,11 +13,49 @@
 
 ---
 
-## 2) 程序行为（必须）
+## 2) 模型输入输出尺寸（必须写死在实现里）
+
+> 下面是当前拆分流水线下的标准尺寸。你写 C++ 时请按这些尺寸定义常量，便于后续扩展到 inference 测试。
+
+### 2.1 Encoder
+- 输入：`image` `float32[1, 3, 1024, 1024]`
+- 输出：`image_embeddings` `float32[1, 256, 64, 64]`
+
+### 2.2 Part1 (Prompt Encoding)
+- 输入0：`point_embedding_pe` `float32[1, N, 256]`
+- 输入1：`point_labels` `float32[1, N]`
+- 输出：`sparse_embedding` `float32[1, N, 256]`
+- 本项目常用 `N=5`。
+
+### 2.3 Part2 (Transformer)
+- 输入0：`image_embeddings` `float32[1, 256, 64, 64]`
+- 输入1：`sparse_embedding` `float32[1, 5, 256]`
+- 输出0：`hs` `float32[1, 10, 256]`
+- 输出1：`src` `float32[1, 4096, 256]`
+
+### 2.4 Part3 (Mask Head)
+- 输入0：`hs` `float32[1, 10, 256]`
+- 输入1：`src` `float32[1, 4096, 256]`
+- 输出0：`scores` `float32[1, 4]`
+- 输出1：`masks` `float32[1, 4, 256, 256]`
+
+### 2.5 Part3 消融变体（重点）
+- `p3_base / p3_no_score / p3_no_deconv / p3_no_gemm / p3_no_tanh / p3_no_unsqueeze / p3_minimal`
+- **以上所有 Part3 变体 I/O 尺寸必须与 2.4 完全一致**。
+
+### 2.6 常用元素个数（便于 C++ 分配/校验）
+- `hs`: `1*10*256 = 2,560`
+- `src`: `1*4096*256 = 1,048,576`
+- `scores`: `1*4 = 4`
+- `masks`: `1*4*256*256 = 262,144`
+
+---
+
+## 3) 程序行为（必须）
 
 1. 支持命令行输入多个 tvn 路径。
 2. 每个模型独立创建模型对象，调用 `loadModel` 后立刻释放。
-3. 不调用 `inference()`。
+3. 当前阶段只做 `loadModel`，不调用 `inference()`。
 4. 每个模型打印一行固定格式日志：
    - 成功：`MODEL=<name> LOAD=PASS`
    - 失败：`MODEL=<name> LOAD=FAIL ERR=<message>`
@@ -28,12 +66,12 @@
 
 ---
 
-## 3) CLI 设计（必须）
+## 4) CLI 设计（必须）
 
 示例：
 
 ```bash
-./test_part3_load_only --w 0 --h 0 a.tvn b.tvn c.tvn
+./test_part3_load_only --w 0 --h 0 p3_base.tvn p3_no_gemm.tvn p3_minimal.tvn
 ```
 
 参数约定：
@@ -47,7 +85,7 @@
 
 ---
 
-## 4) 错误处理与日志规范
+## 5) 错误处理与日志规范
 
 - `try/catch` 仅包围 `loadModel` 调用，避免吞掉上下文。
 - 打印尽可能完整的错误信息：返回码、异常字符串、SDK 错误文本。
@@ -56,7 +94,7 @@
 
 ---
 
-## 5) 代码结构建议
+## 6) 代码结构建议
 
 - `struct CaseResult { name, pass, err };`
 - `bool run_one(const std::string& tvn_path, int w, int h, CaseResult& out)`
@@ -66,9 +104,9 @@
 
 ---
 
-## 6) 最小验收标准
+## 7) 最小验收标准
 
 - 单次可测试多个 tvn。
 - 输出稳定且可机读。
-- 不依赖推理输入数据。
-- 可直接用于比较不同 Part3 变体在 TV 端的 load 成功率。
+- 目前仅验证加载，不依赖推理输入数据。
+- 文档中的 I/O 尺寸常量已在代码中体现（即使当前仅 load，不做 inference）。
