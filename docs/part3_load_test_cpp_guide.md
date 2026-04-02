@@ -1,85 +1,68 @@
-# Part3 TVN `loadModel` 最小 C++ 测试指南（给另一个 AI）
+# Part3 C++ Load 测试指南（给另一个 AI）
 
-目标：让另一个 AI 快速写出一个 **仅测试加载** 的 C++ 程序，批量验证以下 5 个 Part3 变体在 TV 端是否可加载：
-
-- `part3_fixC.onnx`
-- `part3_fixCE.onnx`
-- `part3_fixCDE.onnx`
-- `part3_fixCD.onnx`
-- `part3_vanilla.onnx`
-
-> 你（另一个 AI）只需要生成 C++ 测试代码，不要改模型，不要改编译链。
+目的：让另一个 AI 直接写出 `tests/test_part3_load_only.cpp`，批量测试 Part3 变体的 `loadModel`。
 
 ---
 
-## 1) 产物要求
+## 1) 最重要结论（请在代码里明确写注释）
 
-生成一个文件：`tests/test_part3_load_only.cpp`
+**所有 Part3 变体输入/输出完全一致。**
 
-程序行为：
+### 变体列表
+- `p3_base`
+- `p3_no_score`
+- `p3_no_deconv`
+- `p3_no_gemm`
+- `p3_no_tanh`
+- `p3_no_unsqueeze`
+- `p3_minimal`
 
-1. 从命令行读取多个 `*.tvn` 路径（与上面 5 个变体一一对应）。
-2. 对每个路径依次调用 `loadModel(...)`。
-3. **不调用 inference**（当前阶段只关心 load）。
-4. 每个模型打印一行结构化结果：
+### 统一输入（所有变体相同）
+- `hs`: `float32[1, 10, 256]`（2560）
+- `src`: `float32[1, 4096, 256]`（1048576）
+
+### 统一输出（所有变体相同）
+- `scores`: `float32[1, 4]`（4）
+- `masks`: `float32[1, 4, 256, 256]`（262144）
+
+---
+
+## 2) C++ 程序必须实现的行为
+
+目标文件：`tests/test_part3_load_only.cpp`
+
+1. 支持输入多个 `.tvn` 路径。
+2. 对每个 tvn：独立创建模型对象 -> 调用 `loadModel` -> 释放对象。
+3. 不调用 `inference()`（只测 load）。
+4. 每个模型输出一行：
    - `MODEL=<name> LOAD=PASS`
-   - 或 `MODEL=<name> LOAD=FAIL ERR=<error_code_or_msg>`
-5. 程序最终返回码：
-   - 全部 PASS 返回 `0`
-   - 只要有一个 FAIL 返回 `1`
+   - `MODEL=<name> LOAD=FAIL ERR=<message>`
+5. 最后输出：`SUMMARY PASS=<n> FAIL=<n> TOTAL=<n>`。
+6. 返回码：有 FAIL 返回 `1`，否则返回 `0`。
 
 ---
 
-## 2) 输入参数约定
+## 3) CLI 约定
 
-建议命令行：
+示例：
 
 ```bash
-./test_part3_load_only --w 0 --h 0 \
-  part3_fixC.tvn part3_fixCE.tvn part3_fixCDE.tvn part3_fixCD.tvn part3_vanilla.tvn
+./test_part3_load_only --w 0 --h 0 p3_base.tvn p3_no_gemm.tvn p3_minimal.tvn
 ```
 
-要求支持：
+参数：
+- `--w`：传给 `loadModel` 的 width（默认 0）
+- `--h`：传给 `loadModel` 的 height（默认 0）
+- 位置参数：若干 `.tvn`
 
-- `--w` / `--h`：传给 `loadModel` 的宽高参数（默认 0/0）
-- 位置参数：任意数量的 tvn 路径
-
-备注：后续可用同一程序重复测试 `(w,h)=(64,64)`。
-
----
-
-## 3) 实现要点（必须遵守）
-
-1. 每次测试前后都创建/释放独立模型对象，避免句柄污染下一个测试。
-2. `try/catch` 只包围 `loadModel` 调用和错误信息输出（不要吞掉错误）。
-3. 输出必须稳定、可 grep（固定 key：`MODEL=`, `LOAD=`, `ERR=`）。
-4. 失败时输出尽可能完整：错误码、异常字符串、SDK 返回值。
-5. 不要做随机输入，不要分配大 buffer，不要推理。
+建议固定跑两轮：
+- `--w 0 --h 0`
+- `--w 64 --h 64`
 
 ---
 
-## 4) 推荐输出示例
+## 4) 日志规范（便于脚本解析）
 
-```text
-MODEL=part3_fixC.tvn LOAD=PASS
-MODEL=part3_fixCE.tvn LOAD=FAIL ERR=unsupported op: ConvTranspose
-MODEL=part3_fixCDE.tvn LOAD=FAIL ERR=unsupported op: Gemm
-SUMMARY PASS=1 FAIL=2 TOTAL=3
-```
-
----
-
-## 5) 可选增强（有时间再做）
-
-- 增加 `--repeat N`，重复 load N 次，排查偶现加载失败。
-- 增加 `--json out.json`，把结果写成 JSON，方便汇总。
-- 记录每个模型加载耗时（ms）。
-
----
-
-## 6) 验收标准
-
-- 可以一次性批量测 5 个 tvn。
-- 日志一眼可看出每个模型 PASS/FAIL。
-- 不依赖 inference，执行时间应很短。
-- 可直接用于后续“fix 组合 vs load 成功率”统计。
+- 只使用固定 key：`MODEL`、`LOAD`、`ERR`、`SUMMARY`
+- 不要加额外前缀文本
+- `try/catch` 仅包裹 `loadModel` 调用，并输出完整错误信息
