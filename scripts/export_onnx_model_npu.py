@@ -430,6 +430,12 @@ def export_decoder(sam, args):
         )
     print(f"Exported decoder to {onnx_path}")
 
+    # Export PE gaussian matrix for CPU-side PE computation
+    pe_matrix = sam.prompt_encoder.pe_layer.positional_encoding_gaussian_matrix.cpu().numpy()
+    pe_path = os.path.join(os.path.dirname(onnx_path), "pe_gaussian_matrix.bin")
+    pe_matrix.astype(np.float32).tofile(pe_path)
+    print(f"Exported PE gaussian matrix to {pe_path}  (shape {pe_matrix.shape}, {os.path.getsize(pe_path)} bytes)")
+
     _print_onnx_summary(onnx_path)
 
     if args.check_ops_only:
@@ -442,8 +448,9 @@ def export_decoder(sam, args):
         print(f"    point_embedding_pe: FLOAT [1, {N}, {embed_dim}]  (CPU pre-computed)")
         print(f"    point_labels:       FLOAT [1, {N}]")
         print()
-        print(f"  NOTE: point_embedding_pe must be pre-computed on CPU:")
-        print(f"    pe = compute_point_pe(sam, point_coords)")
+        print(f"  PE gaussian matrix: {pe_path}")
+        print(f"    Shape: float32[{pe_matrix.shape[0]}][{pe_matrix.shape[1]}], row-major")
+        print(f"    Load in C++: fread(matrix, sizeof(float), {pe_matrix.size}, f)")
 
 
 # ============================================================
