@@ -110,7 +110,6 @@ def main() -> None:
     iou_token = torch.randn(1, 256, dtype=torch.float32)
 
     targets = [
-<<<<<<< codex/review-recent-changes-in-repo-jlff9i
         ("p3a_upscale.onnx", p3a, (src,), ["src"], ["upscaled"]),
         ("p3b_hyper.onnx", p3b, (hs,), ["hs"], ["hyper_in", "iou_token"]),
         (
@@ -124,25 +123,13 @@ def main() -> None:
 
     print("Exporting Part3 split-A variants...")
     for filename, model, example, input_names, output_names in targets:
-=======
-        ("p3a_upscale.onnx", p3a, (src,), ["upscaled"]),
-        ("p3b_hyper.onnx", p3b, (hs,), ["hyper_in", "iou_token"]),
-        ("p3c_fuse_score.onnx", p3c, (hyper_in, upscaled, iou_token), ["scores", "masks"]),
-    ]
-
-    print("Exporting Part3 split-A variants...")
-    for filename, model, example, output_names in targets:
->>>>>>> master
         out_path = os.path.join(args.output_dir, filename)
         torch.onnx.export(
             model,
             example,
             out_path,
-<<<<<<< codex/review-recent-changes-in-repo-jlff9i
             input_names=input_names,
-=======
-            input_names=None,
->>>>>>> master
+            input_names=input_names,
             output_names=output_names,
             opset_version=args.opset,
             do_constant_folding=not args.no_constant_folding,

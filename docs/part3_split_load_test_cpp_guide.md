@@ -173,7 +173,6 @@
 如果时间允许，再补一个脚本：
 
 - `scripts/run_part3_split_load_test.sh`：一键跑两轮（`0x0` 与 `64x64`）并归档日志。
-<<<<<<< codex/review-recent-changes-in-repo-jlff9i
 
 ---
 
@@ -270,5 +269,3 @@
 - `--repeat 1`
 
 这样你可以快速验证“第几次循环开始卡住”。
-=======
->>>>>>> master
