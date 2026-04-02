@@ -10,11 +10,15 @@ diagnosis. It focuses on operator-level ablations:
 - p3_no_gemm
 - p3_no_tanh
 - p3_no_unsqueeze
+- p3_single_mask
 - p3_minimal
 
-Each exported ONNX keeps the same I/O contract:
+Most exported ONNX variants keep the same I/O contract:
   inputs:  hs [1,10,256], src [1,4096,256]
   outputs: scores [1,4], masks [1,4,256,256]
+
+Exception:
+  p3_single_mask -> scores [1,1], masks [1,1,256,256]
 """
 
 from __future__ import annotations
@@ -25,7 +29,6 @@ import os
 from collections import Counter
 
 import onnx
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,15 +82,17 @@ class Part3Variant(nn.Module):
         no_gemm: bool = False,
         no_tanh: bool = False,
         no_unsqueeze: bool = False,
+        single_mask: bool = False,
         minimal: bool = False,
     ):
         super().__init__()
         self.minimal = minimal
         self.no_score = no_score
         self.no_unsqueeze = no_unsqueeze
+        self.single_mask = single_mask
 
         md = sam.mask_decoder
-        self.num_mask_tokens = md.num_mask_tokens
+        self.num_mask_tokens = 1 if single_mask else md.num_mask_tokens
         self.mask_threshold = sam.mask_threshold
         self.stability_score_offset = 1.0
 
@@ -137,7 +142,7 @@ class Part3Variant(nn.Module):
 
     def _constant_scores(self, hs: torch.Tensor) -> torch.Tensor:
         """No-score path without ReduceSum (avoid hs.sum)."""
-        return hs[:, :4, :1].reshape(1, 4)
+        return hs[:, :self.num_mask_tokens, :1].reshape(1, self.num_mask_tokens)
 
     def _minimal_outputs(self, hs: torch.Tensor, src: torch.Tensor):
         """Input-dependent minimal path to avoid invalid optimized constant graph."""
@@ -202,50 +207,6 @@ def export_onnx(model: nn.Module, out_path: str, opset: int = 11, constant_foldi
 
 
 
-def convert_int64_to_int32(onnx_path: str) -> int:
-    """Convert int64/int16 tensors in ONNX graph to int32 for NPU compatibility."""
-    from onnx import TensorProto
-
-    model = onnx.load(onnx_path)
-    INT64, INT16, INT32 = TensorProto.INT64, TensorProto.INT16, TensorProto.INT32
-    convertible = {INT64, INT16}
-    changed = 0
-
-    def _np_dt(dt):
-        return np.int64 if dt == INT64 else np.int16
-
-    for node in model.graph.node:
-        if node.op_type == "Cast":
-            for attr in node.attribute:
-                if attr.name == "to" and attr.i in convertible:
-                    attr.i = INT32
-                    changed += 1
-
-    for node in model.graph.node:
-        if node.op_type in ("ConstantOfShape", "Constant"):
-            for attr in node.attribute:
-                if attr.name == "value" and attr.t.data_type in convertible and attr.t.raw_data:
-                    raw = np.frombuffer(attr.t.raw_data, dtype=_np_dt(attr.t.data_type))
-                    attr.t.raw_data = raw.astype(np.int32).tobytes()
-                    attr.t.data_type = INT32
-                    changed += 1
-
-    for init in model.graph.initializer:
-        if init.data_type in convertible and init.raw_data:
-            raw = np.frombuffer(init.raw_data, dtype=_np_dt(init.data_type))
-            init.raw_data = raw.astype(np.int32).tobytes()
-            init.data_type = INT32
-            changed += 1
-
-    for vi in list(model.graph.value_info) + list(model.graph.input) + list(model.graph.output):
-        t = vi.type.tensor_type
-        if t.elem_type in convertible:
-            t.elem_type = INT32
-            changed += 1
-
-    onnx.save(model, onnx_path)
-    return changed
-
 
 def count_ops(onnx_path: str) -> Counter:
     m = onnx.load(onnx_path)
@@ -273,6 +234,7 @@ def main() -> None:
         "p3_no_gemm": dict(no_gemm=True),
         "p3_no_tanh": dict(no_tanh=True),
         "p3_no_unsqueeze": dict(no_unsqueeze=True),
+        "p3_single_mask": dict(single_mask=True, no_score=True),
         "p3_minimal": dict(minimal=True),
     }
 
@@ -281,9 +243,6 @@ def main() -> None:
         model = Part3Variant(sam, **cfg)
         out_path = os.path.join(args.output_dir, f"{name}.onnx")
         export_onnx(model, out_path, opset=args.opset, constant_folding=not args.no_constant_folding)
-        changed = convert_int64_to_int32(out_path)
-        if changed:
-            print(f"    int64/int16->int32: {changed}")
         ops = count_ops(out_path)
         top = ", ".join(f"{k}({v})" for k, v in sorted(ops.items()))
         print(f"  {name:16s} -> {out_path}")

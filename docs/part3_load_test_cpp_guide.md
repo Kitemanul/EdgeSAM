@@ -4,9 +4,10 @@
 
 ---
 
-## 1) 最重要结论（请在代码里明确写注释）
+## 1) 最重要结论
 
-**所有 Part3 变体输入/输出完全一致。**
+- 常规变体使用 4-mask 输出。
+- 新增一个诊断变体：`p3_single_mask`（只输出 1 个 mask），用于优先排查共享子图复杂度问题。
 
 ### 变体列表
 - `p3_base`
@@ -15,19 +16,30 @@
 - `p3_no_gemm`
 - `p3_no_tanh`
 - `p3_no_unsqueeze`
+- `p3_single_mask`（诊断优先）
 - `p3_minimal`
-
-### 统一输入（所有变体相同）
-- `hs`: `float32[1, 10, 256]`（2560）
-- `src`: `float32[1, 4096, 256]`（1048576）
-
-### 统一输出（所有变体相同）
-- `scores`: `float32[1, 4]`（4）
-- `masks`: `float32[1, 4, 256, 256]`（262144）
 
 ---
 
-## 2) C++ 程序必须实现的行为
+## 2) 输入输出规格（必须写死）
+
+统一输入（全部变体相同）：
+- `hs`: `float32[1, 10, 256]`（2560）
+- `src`: `float32[1, 4096, 256]`（1048576）
+
+### 2.1 常规变体输出（4-mask）
+适用：`p3_base/p3_no_score/p3_no_deconv/p3_no_gemm/p3_no_tanh/p3_no_unsqueeze/p3_minimal`
+- `scores`: `float32[1, 4]`（4）
+- `masks`: `float32[1, 4, 256, 256]`（262144）
+
+### 2.2 单 mask 变体输出
+适用：`p3_single_mask`
+- `scores`: `float32[1, 1]`（1）
+- `masks`: `float32[1, 1, 256, 256]`（65536）
+
+---
+
+## 3) C++ 程序必须实现的行为
 
 目标文件：`tests/test_part3_load_only.cpp`
 
@@ -42,12 +54,12 @@
 
 ---
 
-## 3) CLI 约定
+## 4) CLI 约定
 
 示例：
 
 ```bash
-./test_part3_load_only --w 0 --h 0 p3_base.tvn p3_no_gemm.tvn p3_minimal.tvn
+./test_part3_load_only --w 0 --h 0 p3_single_mask.tvn p3_base.tvn p3_no_gemm.tvn
 ```
 
 参数：
@@ -61,7 +73,7 @@
 
 ---
 
-## 4) 日志规范（便于脚本解析）
+## 5) 日志规范（便于脚本解析）
 
 - 只使用固定 key：`MODEL`、`LOAD`、`ERR`、`SUMMARY`
 - 不要加额外前缀文本
