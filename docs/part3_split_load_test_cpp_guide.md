@@ -173,3 +173,102 @@
 如果时间允许，再补一个脚本：
 
 - `scripts/run_part3_split_load_test.sh`：一键跑两轮（`0x0` 与 `64x64`）并归档日志。
+<<<<<<< codex/review-recent-changes-in-repo-jlff9i
+
+---
+
+## 8) 针对“单测都过，但 A->B->C 串行卡住”的必加诊断
+
+你现在的现象是：
+
+- `P3A` / `P3B` / `P3C` **单独进程** 都能 `load + minimal infer` 通过；
+- 但同一进程按 `A -> B -> C` 顺序执行时，在 `P3B` 后卡住。
+
+这类问题通常不是算子正确性，而是**运行时资源生命周期**（设备上下文、异步队列、buffer 复用、析构时机）问题。  
+因此另一个 AI 写 C++ 程序时，下面这些点必须实现，否则日志会“看起来像模型问题”，其实是 harness 问题。
+
+### 8.1 必须把“串行模式”拆成 3 个等级
+
+1. `isolated`：每个模型在独立进程跑（最稳，作为基线）
+2. `sequential_recreate`：同一进程，**每个模型都新建 runtime + load + infer + unload/destroy**
+3. `sequential_reuse_runtime`：同一进程，复用 runtime（最容易暴露卡住）
+
+要求默认先跑 `isolated` + `sequential_recreate`，`sequential_reuse_runtime` 放到 `--stress-reuse-runtime` 开关下。
+
+### 8.2 每个模型步骤后必须显式做“释放+同步”
+
+每个模型执行完后，按顺序做：
+
+1. 释放输出 tensor / 中间 buffer（先 output，再 input）
+2. 调用 runtime 同步接口（若 SDK 提供，如 `synchronize` / `wait`）
+3. 调用 unload（若 SDK 提供）
+4. 销毁 model 实例
+5. （可选）sleep 10~50ms，帮助设备完成异步回收
+
+> 重点：不要把上一个模型的输入/输出内存复用到下一个模型，除非你明确验证过 SDK 允许。
+
+### 8.3 为“卡住”增加超时保护（非常关键）
+
+对每个阶段加 watchdog 超时（建议 10~30 秒）：
+
+- `LOAD_TIMEOUT_MS`
+- `INFER_TIMEOUT_MS`
+- `UNLOAD_TIMEOUT_MS`
+
+一旦超时，必须打印：
+
+- `MODEL=<...> STEP=<...> STATUS=FAIL ERR=TIMEOUT`
+- 当前阶段耗时 ms
+
+并进入“强制中止当前模型、继续后续模型”的路径，避免整个进程永久挂住。
+
+### 8.4 增加顺序矩阵，不只测 A->B->C
+
+至少补这几组：
+
+- `A`
+- `B`
+- `C`
+- `A->B`
+- `B->C`
+- `A->C`
+- `A->B->C`
+- `C->B->A`
+
+如果只有 `A->B->C` 卡住而 `C->B->A` 不卡，通常说明 teardown 顺序或 buffer 生命周期与特定模型尺寸相关。
+
+### 8.5 新增日志 key（在第 5 节基础上扩展）
+
+允许新增以下 key（用于定位卡住，不会破坏原解析）：
+
+- `MODE`：`ISOLATED` / `SEQUENTIAL_RECREATE` / `SEQUENTIAL_REUSE_RUNTIME`
+- `ORDER`：例如 `A>B>C`
+- `TIME_MS`：阶段耗时
+- `PHASE`：`ALLOC` / `LOAD` / `BIND_IO` / `INFER` / `UNLOAD` / `DESTROY`
+
+示例：
+
+- `MODE=SEQUENTIAL_RECREATE ORDER=A>B>C MODEL=P3B STEP=LOAD STATUS=PASS TIME_MS=37`
+- `MODE=SEQUENTIAL_RECREATE ORDER=A>B>C MODEL=P3B STEP=INFER STATUS=FAIL ERR=TIMEOUT TIME_MS=30000`
+
+### 8.6 强制实现一个“最小复现入口”
+
+除原有 CLI 外，要求另一个 AI 额外支持：
+
+```bash
+--mode isolated|sequential_recreate|sequential_reuse_runtime
+--order A,B,C
+--timeout-ms 30000
+--repeat 5
+```
+
+建议默认：
+
+- `--mode sequential_recreate`
+- `--order A,B,C`
+- `--timeout-ms 30000`
+- `--repeat 1`
+
+这样你可以快速验证“第几次循环开始卡住”。
+=======
+>>>>>>> master
