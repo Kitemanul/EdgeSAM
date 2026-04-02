@@ -25,6 +25,7 @@ import os
 from collections import Counter
 
 import onnx
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -135,14 +136,17 @@ class Part3Variant(nn.Module):
         return intersections / unions
 
     def _constant_scores(self, hs: torch.Tensor) -> torch.Tensor:
-        # Keep dependency so exporter preserves inputs while returning fixed-shaped scores.
-        anchor = hs.sum() * 0.0
-        return torch.ones((1, 4), dtype=hs.dtype, device=hs.device) + anchor
+        """No-score path without ReduceSum (avoid hs.sum)."""
+        return hs[:, :4, :1].reshape(1, 4)
 
     def _minimal_outputs(self, hs: torch.Tensor, src: torch.Tensor):
-        anchor = (hs.sum() + src.sum()) * 0.0
-        scores = torch.ones((1, 4), dtype=hs.dtype, device=hs.device) + anchor
-        masks = torch.zeros((1, 4, 256, 256), dtype=hs.dtype, device=hs.device) + anchor
+        """Input-dependent minimal path to avoid invalid optimized constant graph."""
+        # scores: deterministic slice from hs -> [1,4]
+        scores = hs[:, :4, :1].reshape(1, 4)
+
+        # masks: deterministic path from src -> [1,4,256,256]
+        src_spatial = src.transpose(1, 2).reshape(1, 256, 64, 64)
+        masks = F.interpolate(src_spatial[:, :4, :, :], size=(256, 256), mode="nearest")
         return scores, masks
 
     def forward(self, hs: torch.Tensor, src: torch.Tensor):
@@ -180,7 +184,7 @@ class Part3Variant(nn.Module):
         return scores, masks
 
 
-def export_onnx(model: nn.Module, out_path: str, opset: int = 11) -> None:
+def export_onnx(model: nn.Module, out_path: str, opset: int = 11, constant_folding: bool = True) -> None:
     model.eval()
     hs = torch.randn(1, 10, 256, dtype=torch.float32)
     src = torch.randn(1, 4096, 256, dtype=torch.float32)
@@ -192,9 +196,55 @@ def export_onnx(model: nn.Module, out_path: str, opset: int = 11) -> None:
             input_names=["hs", "src"],
             output_names=["scores", "masks"],
             opset_version=opset,
-            do_constant_folding=True,
+            do_constant_folding=constant_folding,
             verbose=False,
         )
+
+
+
+def convert_int64_to_int32(onnx_path: str) -> int:
+    """Convert int64/int16 tensors in ONNX graph to int32 for NPU compatibility."""
+    from onnx import TensorProto
+
+    model = onnx.load(onnx_path)
+    INT64, INT16, INT32 = TensorProto.INT64, TensorProto.INT16, TensorProto.INT32
+    convertible = {INT64, INT16}
+    changed = 0
+
+    def _np_dt(dt):
+        return np.int64 if dt == INT64 else np.int16
+
+    for node in model.graph.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i in convertible:
+                    attr.i = INT32
+                    changed += 1
+
+    for node in model.graph.node:
+        if node.op_type in ("ConstantOfShape", "Constant"):
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t.data_type in convertible and attr.t.raw_data:
+                    raw = np.frombuffer(attr.t.raw_data, dtype=_np_dt(attr.t.data_type))
+                    attr.t.raw_data = raw.astype(np.int32).tobytes()
+                    attr.t.data_type = INT32
+                    changed += 1
+
+    for init in model.graph.initializer:
+        if init.data_type in convertible and init.raw_data:
+            raw = np.frombuffer(init.raw_data, dtype=_np_dt(init.data_type))
+            init.raw_data = raw.astype(np.int32).tobytes()
+            init.data_type = INT32
+            changed += 1
+
+    for vi in list(model.graph.value_info) + list(model.graph.input) + list(model.graph.output):
+        t = vi.type.tensor_type
+        if t.elem_type in convertible:
+            t.elem_type = INT32
+            changed += 1
+
+    onnx.save(model, onnx_path)
+    return changed
 
 
 def count_ops(onnx_path: str) -> Counter:
@@ -207,6 +257,8 @@ def main() -> None:
     parser.add_argument("checkpoint", type=str, help="Path to EdgeSAM checkpoint (.pth)")
     parser.add_argument("--output-dir", type=str, default="./part3_tv_ablation", help="Output directory")
     parser.add_argument("--opset", type=int, default=11, help="ONNX opset version")
+    parser.add_argument("--no-constant-folding", action="store_true",
+                        help="Disable ONNX constant folding during export")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -228,7 +280,10 @@ def main() -> None:
     for name, cfg in variants.items():
         model = Part3Variant(sam, **cfg)
         out_path = os.path.join(args.output_dir, f"{name}.onnx")
-        export_onnx(model, out_path, opset=args.opset)
+        export_onnx(model, out_path, opset=args.opset, constant_folding=not args.no_constant_folding)
+        changed = convert_int64_to_int32(out_path)
+        if changed:
+            print(f"    int64/int16->int32: {changed}")
         ops = count_ops(out_path)
         top = ", ".join(f"{k}({v})" for k, v in sorted(ops.items()))
         print(f"  {name:16s} -> {out_path}")
