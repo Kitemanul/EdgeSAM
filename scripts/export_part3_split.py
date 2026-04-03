@@ -129,7 +129,6 @@ def main() -> None:
             example,
             out_path,
             input_names=input_names,
-            input_names=input_names,
             output_names=output_names,
             opset_version=args.opset,
             do_constant_folding=not args.no_constant_folding,
