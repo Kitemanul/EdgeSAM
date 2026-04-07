@@ -79,6 +79,7 @@ Our approach involves distilling the original ViT-based SAM image encoder into a
 - [Train and Eval](#train)
 - [Web Demo](#demo)
 - [CoreML / ONNX Export](#export)
+- [NPU Decoder Workflow (Current)](#npu-decoder-workflow-current)
 - [Checkpoints](#checkpoints)
 - [iOS App](#ios)
 - [Acknowledgements](#acknowledgement)
@@ -217,6 +218,22 @@ For encoder:
 ```
 python scripts/export_onnx_model.py [CHECKPOINT]
 ```
+
+## NPU Decoder Workflow (Current) <a name="npu-decoder-workflow-current"></a>
+
+For the current NPU decoder workstream, use these **primary** entry points:
+
+1. End-to-end C++ implementation guide  
+   `docs/decoder_e2e_cpp_full_guide.md`
+2. NPU-safe export script  
+   `scripts/export_onnx_model_npu.py`
+3. Part1/Part2/Part3 load+infer diagnostic guide  
+   `docs/part123_load_test_cpp_guide.md`
+
+Historical troubleshooting documents and experimental scripts have been moved to:
+
+- `docs/archive/npu_diagnosis/`
+- `scripts/experimental/npu_diagnosis/`
 
 For decoder:
 
