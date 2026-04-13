@@ -36,6 +36,25 @@ parser.add_argument(
     help="If set, export decoder, otherwise export encoder",
 )
 
+parser.add_argument(
+    "--encoder-input-size",
+    type=int,
+    default=1024,
+    help="Encoder input image size (square). E.g. 512 exports an encoder with input [1,3,512,512].",
+)
+
+parser.add_argument(
+    "--decoder-embed-size",
+    type=int,
+    nargs=2,
+    metavar=("H", "W"),
+    default=None,
+    help=(
+        "Override decoder image embedding size (H, W). "
+        "Use this when encoder output embedding size changed, e.g. --decoder-embed-size 32 32."
+    ),
+)
+
 
 def export_encoder_to_onnx(sam, args):
     if args.gelu_approximate:
@@ -43,7 +62,9 @@ def export_encoder_to_onnx(sam, args):
             if isinstance(m, torch.nn.GELU):
                 m.approximate = "tanh"
 
-    image_input = torch.randn(1, 3, 1024, 1024, dtype=torch.float)
+    image_input = torch.randn(
+        1, 3, args.encoder_input_size, args.encoder_input_size, dtype=torch.float
+    )
     sam.forward = sam.forward_dummy_encoder
 
     # Define the input names and output names
@@ -78,10 +99,24 @@ def export_decoder_to_onnx(sam, args):
                 m.approximate = "tanh"
 
     embed_dim = sam.prompt_encoder.embed_dim
-    embed_size = sam.prompt_encoder.image_embedding_size
+    embed_size = (
+        tuple(args.decoder_embed_size)
+        if args.decoder_embed_size is not None
+        else sam.prompt_encoder.image_embedding_size
+    )
+    input_image_size = (args.encoder_input_size, args.encoder_input_size)
+
+    # Keep decoder internal shape assumptions aligned with exported embedding size.
+    # Otherwise prompt_encoder.get_dense_pe() may still produce 64x64 PE and fail
+    # when image_embeddings is exported as e.g. 32x32.
+    sam.prompt_encoder.image_embedding_size = embed_size
+    sam.prompt_encoder.input_image_size = input_image_size
+    sam_decoder.img_size = args.encoder_input_size
 
     image_embeddings = torch.randn(1, embed_dim, *embed_size, dtype=torch.float)
-    point_coords = torch.randint(low=0, high=1024, size=(1, 5, 2), dtype=torch.float)
+    point_coords = torch.randint(
+        low=0, high=args.encoder_input_size, size=(1, 5, 2), dtype=torch.float
+    )
     point_labels = torch.randint(low=0, high=4, size=(1, 5), dtype=torch.float)
 
     # Define the input names and output names
