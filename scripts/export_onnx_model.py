@@ -104,6 +104,14 @@ def export_decoder_to_onnx(sam, args):
         if args.decoder_embed_size is not None
         else sam.prompt_encoder.image_embedding_size
     )
+    input_image_size = (args.encoder_input_size, args.encoder_input_size)
+
+    # Keep decoder internal shape assumptions aligned with exported embedding size.
+    # Otherwise prompt_encoder.get_dense_pe() may still produce 64x64 PE and fail
+    # when image_embeddings is exported as e.g. 32x32.
+    sam.prompt_encoder.image_embedding_size = embed_size
+    sam.prompt_encoder.input_image_size = input_image_size
+    sam_decoder.img_size = args.encoder_input_size
 
     image_embeddings = torch.randn(1, embed_dim, *embed_size, dtype=torch.float)
     point_coords = torch.randint(
